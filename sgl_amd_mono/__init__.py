@@ -21,6 +21,10 @@ SPECS = {
     "GlmMoeDsaForCausalLM": "sgl_amd_mono.glm53.spec:SPEC",
     "MiniMaxM3SparseForCausalLM": "sgl_amd_mono.minimax.spec:SPEC",
     "MiniMaxM3SparseForConditionalGeneration": "sgl_amd_mono.minimax.spec:SPEC",
+    "Qwen4ExpForConditionalGeneration": "sgl_amd_mono.qwen38_flash_next.spec:SPEC",
+    # The MTP draft (Qwen4ExpForCausalLMMTP: "sgl_amd_mono.qwen38_flash_next.draft:
+    # SPEC") waits for SGLang to route a draft's DRAFT_EXTEND_V2 and one-token
+    # DECODE steps: monokernel API 1 routes a draft by the target's verify key.
 }
 
 # The SGLang names this module reads (test/unit/test_contract.py pins them)
