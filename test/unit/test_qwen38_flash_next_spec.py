@@ -1,9 +1,10 @@
 """The Qwen3.8-Flash-Next gfx950 monokernel spec on CPU (RFC #43949): its registry
-entry (the target; the MTP draft is not registered), the configurations it refuses
-before load, the layer views it refuses after load (meta tensors of the real
-shapes), the verify widths it serves on the NEXTN recipe, its build keys and its
-fallback forward. SGLang checks the declared requirements, the same way for every
-spec."""
+entries (the target and the MTP draft), the configurations it refuses before
+load, the layer views it refuses after load (meta tensors of the real shapes),
+the verify widths it serves on the NEXTN recipe, the draft steps the draft's
+launch takes (routed by the wrapper the draft spec puts in front of its forward),
+its build keys and its fallback forward. SGLang checks the
+declared requirements, the same way for every spec."""
 
 from types import SimpleNamespace
 from unittest import mock
@@ -57,7 +58,7 @@ def _config_reasons(cfg=CFG, hf_config=VL, flydsl=True):
         return q38._config_disable_reasons(cfg, hf_config)
 
 
-def test_the_plugin_registers_the_target_only():
+def test_the_plugin_registers_the_target_and_the_draft():
     # what SGLang's load_plugins() runs, from the sglang.srt.plugins entry point
     sgl_amd_mono.register_specs()
     found, why = registry.find_spec(
@@ -68,19 +69,289 @@ def test_the_plugin_registers_the_target_only():
         backend=sgl_amd_mono.BACKEND, architectures=[TARGET], isa="gfx942"
     )
     assert found is None and "gfx942" in why
-    # monokernel API 1 routes a draft by the target's verify key, and the NEXTN
-    # draft runs DRAFT_EXTEND_V2 and one-token DECODE steps: the draft spec would
-    # build launches that never run
-    assert not registry.spec_registered(
-        backend=sgl_amd_mono.BACKEND, architectures=[DRAFT]
+    # the NEXTN draft's own steps reach its launch through the wrapper _build installs
+    found, why = registry.find_spec(
+        backend=sgl_amd_mono.BACKEND, architectures=[DRAFT], isa="gfx950"
+    )
+    assert found is mtp.SPEC, why
+
+
+def test_the_draft_spec_declares_the_drafts_own_backend():
+    assert mtp.SPEC.api_version == registry.MONOKERNEL_API_VERSION
+    # the draft runs on its QSA backends, stamped "qsa", never the target's
+    assert mtp.SPEC.requires.attention_backends == {"qsa"}
+    assert (
+        not mtp.SPEC.requires.attention_backends & q38.SPEC.requires.attention_backends
+    )
+    assert mtp._tokens_per_request(None) == q38.TOKENS
+    assert registry.Feature.SPECULATIVE_DECODING in mtp.SPEC.features
+
+
+# ---------------------------------------------------------------- draft steps
+@pytest.fixture(autouse=True)
+def _qsa_steps(monkeypatch):
+    """Draft steps run on the draft's QSA backend, as on a server."""
+    monkeypatch.setattr(mtp, "_step_backend", lambda: "qsa")
+
+
+def _hc_dim():
+    from sgl_amd_mono.qwen38_flash_next.gfx950.runner import HC_DIM
+
+    return HC_DIM
+
+
+class _DraftRunner:
+    """A DraftRunner whose launch records the steps it took."""
+
+    L_ext, max_reqs = q38.TOKENS, q38.MAX_R
+
+    def __init__(self):
+        self.launched = []
+
+    def launch(self, fb, hidden_states):
+        self.launched.append((fb.forward_mode.name, int(fb.batch_size)))
+        return "x", "hc"
+
+
+class _MtpLm(torch.nn.Module):
+    """Qwen4ExpForCausalLMMTP's forward signature; records that it ran."""
+
+    def __init__(self):
+        super().__init__()
+        self.ran = []
+        self.lm_head = "lm_head"
+
+    def forward(self, input_ids, positions, forward_batch, input_embeds=None, **kwargs):
+        self.ran.append(forward_batch.forward_mode.name)
+        return "the model's forward"
+
+    def logits_processor(self, input_ids, x, lm_head, fb):
+        return SimpleNamespace(x=x)
+
+    def _set_hc_logits_hidden_states(self, out, hc, fb):
+        out.hidden_states = hc
+
+
+def _step(mode, R, rows, dtype=torch.bfloat16, hc_rows=None):
+    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+    hidden = torch.zeros(rows if hc_rows is None else hc_rows, _hc_dim(), dtype=dtype)
+    return SimpleNamespace(
+        forward_mode=ForwardMode[mode],
+        batch_size=R,
+        input_ids=torch.zeros(rows, dtype=torch.int64),
+        spec_info=SimpleNamespace(hidden_states=hidden),
     )
 
 
-def test_the_draft_spec_takes_the_targets_requirements():
-    assert mtp.SPEC.api_version == registry.MONOKERNEL_API_VERSION
-    assert mtp.SPEC.requires.attention_backends == q38.SPEC.requires.attention_backends
-    assert mtp._tokens_per_request(None) == q38.TOKENS
-    assert registry.Feature.SPECULATIVE_DECODING in mtp.SPEC.features
+TAKEN = [
+    ("DRAFT_EXTEND_V2", 1, 4),
+    ("DRAFT_EXTEND_V2", 8, 32),
+    ("DECODE", 1, 1),
+    ("DECODE", 8, 8),
+]
+NOT_TAKEN = {
+    "nine requests": _step("DECODE", 9, 9),
+    "verify": _step("TARGET_VERIFY", 2, 8),
+    "extend": _step("EXTEND", 2, 8),
+    "three rows a request": _step("DRAFT_EXTEND_V2", 2, 6),
+    "fp32 hidden": _step("DECODE", 2, 2, dtype=torch.float32),
+    "hidden of other rows": _step("DECODE", 2, 2, hc_rows=4),
+}
+
+
+def _wrapped():
+    lm, runner = _MtpLm(), _DraftRunner()
+    mtp._route_draft_steps(lm, mtp._Draft(lm, runner))
+    return lm, runner
+
+
+def test_the_draft_wrapper_keeps_the_forward_signature():
+    import inspect
+
+    lm, _ = _wrapped()
+    # SGLang's graph runners choose what to pass from the forward's parameters
+    assert inspect.signature(lm.forward) == inspect.signature(_MtpLm().forward)
+
+
+@pytest.mark.parametrize("mode, R, rows", TAKEN)
+@pytest.mark.parametrize("as_kwarg", [False, True], ids=["positional", "kwarg"])
+def test_the_draft_wrapper_launches_the_draft_steps(mode, R, rows, as_kwarg):
+    lm, runner = _wrapped()
+    fb = _step(mode, R, rows)
+    out = (
+        lm.forward(fb.input_ids, "positions", forward_batch=fb)
+        if as_kwarg
+        else lm.forward(fb.input_ids, "positions", fb)
+    )
+    assert (out.x, out.hidden_states) == ("x", "hc")
+    assert runner.launched == [(mode, R)] and lm.ran == []
+
+
+@pytest.mark.parametrize("fb", NOT_TAKEN.values(), ids=NOT_TAKEN.keys())
+@pytest.mark.parametrize("as_kwarg", [False, True], ids=["positional", "kwarg"])
+def test_the_draft_wrapper_runs_the_forward_it_wraps(fb, as_kwarg):
+    lm, runner = _wrapped()
+    out = (
+        lm.forward(input_ids=fb.input_ids, positions="p", forward_batch=fb)
+        if as_kwarg
+        else lm.forward(fb.input_ids, "p", fb)
+    )
+    assert out == "the model's forward"
+    assert lm.ran == [fb.forward_mode.name] and runner.launched == []
+
+
+def test_input_embeds_run_the_forward_the_wrapper_wraps():
+    lm, runner = _wrapped()
+    fb = _step("DECODE", 2, 2)
+    assert lm.forward(fb.input_ids, "p", fb, torch.zeros(2)) == "the model's forward"
+    assert lm.forward(fb.input_ids, "p", fb, input_embeds=torch.zeros(2)) == (
+        "the model's forward"
+    )
+    assert runner.launched == []
+
+
+def test_the_runtimes_forward_wraps_the_draft_wrapper():
+    # build installs the draft wrapper, then SGLang wraps it: API v1 routes the
+    # draft by the target's verify key, which never matches a draft step, so every
+    # draft step reaches the draft wrapper
+    from sglang.srt.monokernels import runtime
+
+    lm, runner = _wrapped()
+    served = frozenset(
+        registry.ShapeKey("target_verify", batch_size=r, tokens_per_request=4)
+        for r in range(1, 9)
+    )
+    built = mtp._Draft(lm, runner)
+    runtime._install_forward(
+        model=lm, built=built, served=served, spec=mtp.SPEC, backend="amd"
+    )
+    for mode, R, rows in TAKEN:
+        fb = _step(mode, R, rows)
+        lm.forward(fb.input_ids, "p", fb)
+    assert runner.launched == [(m, R) for m, R, _ in TAKEN] and lm.ran == []
+
+
+def test_the_wrapper_checks_the_backend_once_a_step_mode(monkeypatch):
+    # what the runtime does for the steps it routes
+    backends = ["qsa", "triton", "triton"]
+    monkeypatch.setattr(mtp, "_step_backend", lambda: backends.pop(0))
+    lm, runner = _wrapped()
+    for mode, R, rows in (("DECODE", 1, 1), ("DECODE", 2, 2)):
+        fb = _step(mode, R, rows)
+        lm.forward(fb.input_ids, "p", fb)
+    fb = _step("DRAFT_EXTEND_V2", 1, 4)
+    with pytest.raises(ValueError, match="this DRAFT_EXTEND_V2 step's is 'triton'"):
+        lm.forward(fb.input_ids, "p", fb)
+    assert runner.launched == [("DECODE", 1), ("DECODE", 2)]
+
+
+@pytest.mark.parametrize("name", ["fp32 hidden", "hidden of other rows"])
+def test_a_draft_shaped_step_the_launch_cannot_read_is_refused_in_capture(
+    monkeypatch, caplog, name
+):
+    lm, runner = _wrapped()
+    fb = NOT_TAKEN[name]
+    with caplog.at_level("WARNING"):
+        assert lm.forward(fb.input_ids, "p", fb) == "the model's forward"
+    assert "runs the standard path" in caplog.text
+    # a captured graph would run the standard path for good: refused
+    monkeypatch.setattr(mtp, "_is_capturing", lambda: True)
+    with pytest.raises(ValueError, match="refusing to capture"):
+        lm.forward(fb.input_ids, "p", fb)
+    # steps no draft launch takes are not draft-shaped: no refusal
+    for other in ("nine requests", "verify", "extend", "three rows a request"):
+        fb = NOT_TAKEN[other]
+        assert lm.forward(fb.input_ids, "p", fb) == "the model's forward"
+    assert runner.launched == []
+
+
+def test_every_draft_call_site_calls_the_model_forward_attribute():
+    # the wrapper replaces the instance attribute model.forward: pin that SGLang's
+    # draft paths call it, so a refactor fails here, not as a silent fallback
+    from pathlib import Path
+
+    import sglang
+
+    root = Path(sglang.__file__).resolve().parent / "srt"
+    calls = {
+        "model_executor/runner/eager_runner.py": "model_runner.model.forward(",
+        "speculative/eagle_draft_extend_cuda_graph_runner.py": (
+            "self.model_runner.model.forward("
+        ),
+        "speculative/eagle_worker_v2.py": "self.draft_runner.forward(",
+        "speculative/eagle_draft_cuda_graph_runner.py": (
+            "self.eagle_worker.draft_forward("
+        ),
+    }
+    for path, call in calls.items():
+        assert call in (root / path).read_text(), (path, call)
+
+
+def test_the_draft_writes_the_buffer_its_input_does_not_overlap():
+    from sgl_amd_mono.qwen38_flash_next.gfx950.runner import _overlaps
+
+    a, b = torch.zeros(8, 4), torch.zeros(8, 4)
+    assert _overlaps(a, a) and _overlaps(a, a[2:3]) and _overlaps(a[2:], a[:3])
+    assert not _overlaps(a, b) and not _overlaps(a[:2], a[2:])
+
+
+def test_the_draft_reads_new_hidden_states_from_a_fixed_address(monkeypatch):
+    """A chain step's hidden states under rejection sampling are a new tensor each
+    step (a capture allocates them elsewhere than its warmup): the launch reads a
+    copy at a fixed address; a previous step's output is read in place."""
+    from sgl_amd_mono.qwen38_flash_next.gfx950 import runner as R
+
+    S, D = 4, R.HC_DIM
+    r = object.__new__(R.DraftRunner)
+    r.hc_bufs = [torch.zeros(S, D, dtype=torch.bfloat16) for _ in range(2)]
+    r.hin_buf = torch.zeros(S, D, dtype=torch.bfloat16)
+    r.ids_buf = torch.zeros(S, dtype=torch.int64)
+    r.x_buf = torch.zeros(S, 8, dtype=torch.bfloat16)
+    r.scratch = r.epoch = torch.zeros(4, dtype=torch.int32)
+    read = []
+    r.prepare_step = lambda fb, hs: (read.append(hs.data_ptr()), (r.scratch, None))[1]
+    r.kernel = lambda build: lambda *a, **kw: None
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+    fb = SimpleNamespace(input_ids=torch.arange(2))
+    for _ in range(2):  # a new tensor each step: one table address
+        new = torch.ones(2, D, dtype=torch.bfloat16)
+        _, hc = r.launch(fb, new)
+        assert read[-1] == r.hin_buf.data_ptr()
+        assert torch.equal(r.hin_buf[:2], new)
+        assert hc.data_ptr() == r.hc_bufs[0].data_ptr()
+    _, hc2 = r.launch(fb, hc)  # the previous step's output: in place
+    assert read[-1] == hc.data_ptr() and hc2.data_ptr() == r.hc_bufs[1].data_ptr()
+
+
+def test_build_installs_the_wrapper(monkeypatch, caplog):
+    from sgl_amd_mono.qwen38_flash_next.gfx950 import runner as R
+    from sgl_amd_mono.qwen38_flash_next.gfx950 import weights as W
+
+    class _Runner(_DraftRunner):
+        def __init__(self, **kw):
+            super().__init__()
+            # fault injection arms the target's launches only
+            assert kw["fault"] is None
+
+        def set_deadline(self, s):
+            pass
+
+    monkeypatch.setattr(W, "param_ptrs", lambda model: {})
+    monkeypatch.setattr(W, "mtp_views", lambda model, copies, params: {})
+    monkeypatch.setattr(R, "DraftRunner", _Runner)
+    layer = SimpleNamespace(rotary_emb=None, attn=SimpleNamespace(layer_id=48))
+    lm = _MtpLm()
+    lm.model = SimpleNamespace(
+        layers=[layer], embed_tokens=SimpleNamespace(weight=torch.zeros(1))
+    )
+    with caplog.at_level("INFO"):
+        draft = mtp._build(lm, VL, SimpleNamespace(copies={}, deadline_s=1.0))
+    assert "forward" in lm.__dict__
+    assert "are routed by the spec's wrapper of the draft's forward" in caplog.text
+    fb = _step("DECODE", 1, 1)
+    lm.forward(fb.input_ids, "p", fb)
+    assert draft.runner.launched == [("DECODE", 1)] and lm.ran == []
 
 
 def test_the_recipe_is_accepted():

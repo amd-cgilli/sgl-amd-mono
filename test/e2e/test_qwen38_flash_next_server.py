@@ -107,6 +107,12 @@ class TestMonokernelVerify(CustomTestCase):
             f"batch size {list(range(1, 9))} x 4 tokens",
             _logs(self.logs),
         )
+        # the MTP draft's own steps: SGLang's capture check never sees them, so the
+        # spec logs each draft key at its first launch (graph warmup included)
+        logs = _logs(self.logs)
+        self.assertIn("monokernel qwen38_flash_next MTP draft: draft extend", logs)
+        for key in (("DRAFT_EXTEND_V2", 1, 4), ("DECODE", 1, 1)):
+            self.assertIn(f"monokernel qwen38_flash_next MTP draft runs {key}", logs)
 
     # Runs last: after eager verify steps of more than 8 requests, SGLang's QSA prefill
     # (_compact_kv) faults on the next long multi-prompt prefill, with the monokernel

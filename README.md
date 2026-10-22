@@ -19,12 +19,12 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 | GLM-5.3 | MI355X (gfx950) | 4, 8 | All 75 MoE layers (one launch each), in decode and MTP verify steps of up to 8 rows (4 at TP4) |
 | MiniMax-M3 (MXFP4) | MI350X, MI355X (gfx950) | 4 | The 57 sparse MoE layers in decode and EAGLE3 verify steps of up to 16 rows |
 | MiniMax-M3.1-Flash (NVFP4 experts) | MI350X (gfx950) | 4 | o_proj and the FFN of the 57 sparse layers, after SGLang's attention, in decode and DSpark verify steps of up to 16 rows |
-| Qwen3.8-Flash-Next (MXFP4) | MI355X (gfx950) | 1 | The whole model (48 layers in 13 launches) in NEXTN verify steps of up to 8 requests x 4 tokens; the MTP draft kernel waits on SGLang routing draft steps |
+| Qwen3.8-Flash-Next (MXFP4) | MI355X (gfx950) | 1 | The whole model (48 layers in 13 launches) in NEXTN verify steps of up to 8 requests x 4 tokens; the MTP draft's draft extend (up to 8 x 4 rows) and draft decode steps (up to 8 x 1) are routed to its launch, pending a GPU run with CUDA graphs |
 
 ### Design
 
 - **One or two launches per layer, or several layers per launch.** DeepSeek-V4.1-Flash runs two. K1 runs the attention's input mixing and projections and writes the KV cache. K2 runs the sparse attention, the output projections, the FFN mixing, the MoE and both all-reduces. On the indexer layers, K2i runs between them: it scores the FP4 index keys in one launch, and SGLang's top-k kernels select each row's top-k from its logits. GLM-5.3-Flash and GLM-5.3 run each covered layer as one launch; GLM-5.3-Flash also runs the final norm, the LM head and the logits all-gather as one tail launch. MiniMax-M3 runs one too: K1 (the input norm, the fused qkv and index projection, the q / k norms, RoPE, the KV and index-key writes and the index scores) runs in front of the block selection, the sparse attention, o_proj, the router, the MoE and both all-reduces, in one launch. MiniMax-M3.1-Flash keeps SGLang's attention and runs the rest of each sparse layer as one launch: o_proj, the attention all-reduce and residual add, the post-attention norm, the router, the shared and routed experts and the MoE all-reduce. Qwen3.8-Flash-Next runs on one GPU, so a launch holds whole layers: 3 Gated DeltaNet layers and a QSA layer each, 13 launches from the token embedding to the model-level hyper-connection mixer.
-- **Graph-safe routing.** Each step is routed by its CUDA graph key alone, so every rank makes the same decision and a captured graph replays the decision made at capture.
+- **Graph-safe routing.** Each step is routed by its CUDA graph key alone, so every rank makes the same decision and a captured graph replays the decision made at capture. Monokernel API 1 does not route a draft model's own steps, so Qwen3.8-Flash-Next's MTP draft spec routes its draft extend and draft decode steps itself: a wrapper it puts in front of the draft's forward at build routes them on the same static step properties and checks the draft's attention backend; it can move to SGLang if a later API routes draft steps. SGLang's capture check does not see draft steps, so the spec logs each draft key at its first launch and refuses to capture a draft-shaped step it cannot run.
 - **Fail-stop synchronization.** Every wait on another workgroup or GPU has a deadline. A failed wait stops the launch on every rank, so no token from a failed step is returned.
 - **In-place weights.** The kernels read the weights SGLang loaded. The few weights that need another layout or precision (MiniMax-M3's attention projections run in FP8; MiniMax-M3.1-Flash's shared expert keeps the checkpoint's MXFP8 values) are copied once at startup, and each copy is logged.
 
@@ -161,7 +161,7 @@ sgl-amd-mono/
 │   ├── qwen38_a95b_mxfp4/   # Qwen3.8-2.4T-A95B-Quark-MXFP4; spec and kernels land in its PR
 │   └── qwen38_flash_next/
 │       ├── spec.py      # target model: spec and forward
-│       ├── draft.py     # MTP draft: spec and forward (not registered yet)
+│       ├── draft.py     # MTP draft: spec and forward
 │       ├── check.py     # SGLANG_AMD_MONO_CHECK: weights and each step against SGLang's own
 │       └── gfx950/      # kernel, layer views and launch runner
 └── test/

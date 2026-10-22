@@ -581,9 +581,18 @@ class DraftRunner(_Base):
         self.scratch = torch.zeros(nbytes // 4, dtype=torch.int32, device=device)
         bf16 = dict(dtype=torch.bfloat16, device=device)
         self.x_buf = torch.empty(S, HIDDEN, **bf16)
-        # draft step i + 1 reads step i's output: the output alternates
+        # draft step i + 1 reads step i's output: a step writes the buffer its
+        # input does not overlap, chosen by address so a capture repeats warmup
         self.hc_bufs = [torch.empty(S, HC_DIM, **bf16) for _ in range(2)]
-        self._calls = 0
+        # a chain step's input_ids is a new tensor each step (topk_index.flatten()):
+        # the launch reads a copy at a fixed address, so the tables a warmup built
+        # are the ones its graph capture finds
+        self.ids_buf = torch.zeros(S, dtype=torch.int64, device=device)
+        # hidden states that are not a previous step's output are read from a copy
+        # at a fixed address: with rejection sampling a chain step's hidden states
+        # are a new tensor each step (select_top_k_tokens indexes them), and a
+        # graph capture allocates it at another address than its warmup
+        self.hin_buf = torch.zeros(S, HC_DIM, **bf16)
         self.ssq_buf = torch.zeros(S, 4, LY.NPART, dtype=torch.float32, device=device)
         # a QSA-only launch reads no mamba slot
         self.mamba_map = torch.zeros(4096, dtype=torch.int32, device=device)
@@ -600,7 +609,6 @@ class DraftRunner(_Base):
         key = (
             R,
             S,
-            fb.input_ids.data_ptr(),
             fb.positions.data_ptr(),
             fb.out_cache_loc.data_ptr(),
             fb.req_pool_indices.data_ptr(),
@@ -626,7 +634,7 @@ class DraftRunner(_Base):
             kvp.qsa_rope_position_buffer,
             self.mamba_map,
         )
-        g[LY.G_INPUT_IDS] = fb.input_ids.data_ptr()
+        g[LY.G_INPUT_IDS] = self.ids_buf.data_ptr()
         g[LY.G_EMBED_W] = self.embed_w.data_ptr()
         g[LY.G_MTP_HIN] = hidden_states.data_ptr()
         g[LY.G_FIN_OUT] = self.x_buf.data_ptr()
@@ -648,12 +656,12 @@ class DraftRunner(_Base):
         """A draft step -> (the draft mixer's output x [S, HIDDEN], the
         hyper-connection hidden states [S, HC_DIM])."""
         S = int(fb.input_ids.numel())
+        if not any(_overlaps(b, hidden_states) for b in self.hc_bufs):
+            self.hin_buf[:S].copy_(hidden_states)
+            hidden_states = self.hin_buf[:S]
         table, build = self.prepare_step(fb, hidden_states)
-        hc = self.hc_bufs[self._calls % 2]
-        if hc.data_ptr() == hidden_states.data_ptr():
-            self._calls += 1
-            hc = self.hc_bufs[self._calls % 2]
-        self._calls += 1
+        hc = self.hc_bufs[1 if _overlaps(self.hc_bufs[0], hidden_states) else 0]
+        self.ids_buf[:S].copy_(fb.input_ids.view(-1))
         self.kernel(build)(
             0,
             hc.data_ptr(),
@@ -665,6 +673,14 @@ class DraftRunner(_Base):
         )
         self.epoch[:1].add_(1)
         return self.x_buf[:S], hc[:S]
+
+
+def _overlaps(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Whether two tensors' memory ranges overlap."""
+    a0, b0 = a.data_ptr(), b.data_ptr()
+    a1 = a0 + a.numel() * a.element_size()
+    b1 = b0 + b.numel() * b.element_size()
+    return a0 < b1 and b0 < a1
 
 
 def draft_eligible(fb, hidden_states: Optional[torch.Tensor], L_ext: int, max_reqs: int) -> bool:  # fmt: skip
