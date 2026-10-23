@@ -22,12 +22,18 @@ the PLE n-gram metadata as one table. The bf16 RoPE table is SGLang's own cast.
 A request's verify rows write its draft tokens' KV, index keys and per-token
 GDN, PLE and n-gram states, as SGLang's verify does: request slot r owns row r of
 every verify scratch. A graph's pad rows write KV slot 0, the reserved dummy slot.
+
+``SGLANG_AMD_MONO_CHECK=1`` checks the weights the launches read of three layers
+against the checkpoint at build, then runs SGLang's own forward of every eager
+routed step first and logs the differences of the launches' logits and hidden
+states (``check.py``); the bounds in ``NUMERICS`` come from these runs.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import logging
+import os
 
 import torch
 
@@ -188,7 +194,7 @@ SGLANG_READS = {
 }
 
 # The launches' logits and hidden states (the residual streams after the last
-# layer) against SGLang's forward of the same eager verify step, on
+# layer) against SGLang's forward of the same eager verify step (check mode), on
 # the step's worst row. The launches are bitwise salykova's in-tree kernel (534
 # steps, every launch's stream); the gap is SGLang's own noise: its AITER MXFP4 MoE
 # differs by about 2.6e-3 between two identical forwards, and 48 layers grow that
@@ -323,6 +329,7 @@ class _Built:
 
     def __init__(self, lm, runner):
         self.lm, self.runner = lm, runner
+        self.check = os.environ.get("SGLANG_AMD_MONO_CHECK", "0") == "1"
 
     def forward(
         self,
@@ -346,6 +353,14 @@ class _Built:
             return type(lm).forward(
                 lm, input_ids, positions, forward_batch, get_embedding, pp_proxy_tensors
             )
+        checking = self.check and not torch.cuda.is_current_stream_capturing()
+        ref = None
+        if checking:
+            from sgl_amd_mono.qwen38_flash_next import check
+
+            ref = check.reference(
+                lm, input_ids, positions, forward_batch, self.runner.kinds
+            )
         x, hidden = self.runner.launch(forward_batch)
         # the VL model's forward hands the streams on, as SGLang's does
         lm.model.last_hc_hidden_states = hidden
@@ -353,6 +368,8 @@ class _Built:
             return lm.pooler(x, forward_batch)
         out = lm.logits_processor(input_ids, x, lm.lm_head, forward_batch, None)
         out.hidden_states = hidden
+        if ref is not None:
+            check.compare(ref, out, forward_batch)
         return out
 
 
@@ -388,6 +405,10 @@ def _build(model, hf_config, ctx) -> _Built:
         fault=guard.fault_injection(0),
     )
     runner.set_deadline(ctx.deadline_s)
+    if os.environ.get("SGLANG_AMD_MONO_CHECK", "0") == "1":
+        from sgl_amd_mono.qwen38_flash_next import check
+
+        check.weights(model, kinds)
     # The launches compile the cache strides in, and SGLang sizes the caches after
     # the build: each batch size's launches compile at its first forward (the
     # decode graph runner's eager warmup), then come from FlyDSL's disk cache.
@@ -409,7 +430,7 @@ SPEC = MonoSpec(
     features=frozenset({Feature.SPECULATIVE_DECODING}),
     requires=Requirements(
         dtypes=frozenset({"bfloat16"}),
-        # the backends measured on and off (GSM8K); the launches
+        # the backends measured on and off (GSM8K, check mode); the launches
         # replace every attention of a routed step, and SGLang runs its GDN + QSA
         # hybrid for the rest
         attention_backends=frozenset({"triton", "aiter"}),

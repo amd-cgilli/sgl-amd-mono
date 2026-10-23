@@ -3,8 +3,10 @@ steps of up to 8 requests x 4 tokens run the 13 launches. The startup line shows
 the tested batches run them; batches step past the largest width and back (GSM8K
 at 16 requests), the accept length holds, the tokens of covered steps are scored
 again by the normal prefill path (KL consistency), and a passkey deep in a 126k
-prompt checks the index selection. A stalled wait stops the server before any
-token of the failed step is sent.
+prompt checks the index selection. In check mode the weights the launches read
+equal the checkpoint and every eager verify step is held to the spec's bounds
+against SGLang's forward. A stalled wait stops the server before any token of the
+failed step is sent.
 """
 
 import os
@@ -30,6 +32,7 @@ from sglang.test.test_utils import (
 )
 
 from sgl_amd_mono import BACKEND
+from sgl_amd_mono.qwen38_flash_next.spec import NUMERICS
 
 # a cold FlyDSL cache compiles each batch size's launches at its first forward
 LAUNCH_TIMEOUT = 3600
@@ -158,6 +161,35 @@ class TestMonokernelVerify(CustomTestCase):
         ).json()
         self.assertGreater(r["usage"]["prompt_tokens"], 100_000)
         self.assertIn(str(key), r["choices"][0]["message"]["content"].split("</think>")[-1])  # fmt: skip
+
+
+class TestMonokernelCheck(CustomTestCase):
+    def test_the_weights_and_every_step_are_within_the_bounds(self):
+        # eager verify steps, each against SGLang's forward of the same step
+        with (
+            tempfile.NamedTemporaryFile("w+", suffix=".out") as out,
+            tempfile.NamedTemporaryFile("w+", suffix=".err") as err,
+        ):
+            process = _launch(
+                extra_env={"SGLANG_AMD_MONO_CHECK": "1"},
+                extra_args=["--disable-cuda-graph"],
+                log=(out, err),
+            )
+            try:
+                _gsm8k(parallel=4, num_examples=16)
+            finally:
+                terminate_and_kill_process_tree(process)
+            log = _logs((out, err))
+        self.assertNotIn("monokernel check violation", log)
+        self.assertEqual(len(re.findall(r"monokernel check weights layer \d+", log)), 3)
+        steps = re.findall(r"monokernel check step \(\d+ requests.*", log)
+        self.assertGreater(len(steps), 100, "too few checked steps")
+        for name, bound in NUMERICS.bounds.items():
+            vals = [
+                float(v) for v in re.findall(rf"{re.escape(name)}=([-\d.e+]+)", log)
+            ]
+            worst = min(vals) if name.endswith("cosine") else max(vals)
+            print(f"{name}: worst {worst}, bound {bound}")
 
 
 class TestMonokernelFault(CustomTestCase):

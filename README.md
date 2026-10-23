@@ -138,6 +138,7 @@ sgl-amd-mono/
 │   ├── qwen38_a95b_mxfp4/   # Qwen3.8-2.4T-A95B-Quark-MXFP4; spec and kernels land in its PR
 │   └── qwen38_flash_next/
 │       ├── spec.py      # target model: spec and forward
+│       ├── check.py     # SGLANG_AMD_MONO_CHECK: weights and each step against SGLang's own
 │       └── gfx950/      # kernel, layer views and launch runner
 └── test/
     ├── unit/            # CPU: the specs and the SGLang interface contract
