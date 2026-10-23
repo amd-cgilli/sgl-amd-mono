@@ -73,6 +73,13 @@ SGLANG_READS = {
         "k_layernorm",
     ),
     "srt/models/qwen2_moe.py": ("gate", "shared_expert_gate", "experts"),
+    "srt/models/qwen4_exp_mtp.py": (
+        "model",
+        "pre_fc_norm_embedding",
+        "pre_fc_norm_hidden",
+        "fc_embedding",
+        "fc_hidden",
+    ),
     "srt/models/qwen4_exp.py": (
         "attn_hyper_connection",
         "mlp_hyper_connection",
@@ -435,3 +442,43 @@ def ngram_reasons(ple_layer) -> list[str]:
             f"{LY.NGRAM_DIM}] (no --ple-offload-embedding)"
         )
     return reasons
+
+
+# ---------------------------------------------------------------- the MTP draft
+_MTP_FUSION = {
+    "pre_fc_norm_embedding.weight": (HIDDEN,),
+    "pre_fc_norm_hidden.weight": (HC_DIM,),
+    "fc_embedding.weight": (HIDDEN, HIDDEN),
+    "fc_hidden.weight": (HIDDEN, HIDDEN),
+}
+
+
+def mtp_reasons(lm) -> list[str]:
+    """What the draft launch assumes of SGLang's ``Qwen4ExpForCausalLMMTP``: its QSA
+    layer, its input fusion (separate embedding / hidden projections) and its mixer."""
+    layers = getattr(getattr(lm, "model", None), "layers", None)
+    if layers is None or len(layers) != 1:
+        return ["the MTP draft must hold one decoder layer"]
+    reasons = layer_reasons(layers[0], 0, "qsa")
+    reasons += [
+        f"MTP input fusion: {why}"
+        for name, shape in _MTP_FUSION.items()
+        if (why := _tensor_reason(_get(lm, name), shape, (_BF16,), name)) is not None
+    ]
+    reasons += mixer_reasons(getattr(lm.model, "hyper_connection_mixer", None))
+    return reasons
+
+
+def mtp_views(lm, copies: dict, params: set) -> dict:
+    """The MTP draft's packed views (``packing.pack_mtp``)."""
+    layer = lm.model.layers[0]
+    lw = {f"layers.0.{k}": v for k, v in checkpoint_dict(layer, "qsa", False).items()}
+    lw.update({name: _get(lm, name) for name in _MTP_FUSION})
+    mixer = lm.model.hyper_connection_mixer
+    for name in ("hc_norm", "input_mix_weight_down", "input_mix_weight_up"):
+        lw[f"hyper_connection_mixer.{name}.weight"] = _get(mixer, f"{name}.weight")
+    views = packing.pack_mtp(
+        lw, moe=moe_params(layer.mlp.experts), proj=proj_params(layer, QSA_PROJ)
+    )
+    _log_copies(copies, "mtp packed", (), views, params)
+    return views

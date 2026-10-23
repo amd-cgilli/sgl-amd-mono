@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """The Qwen3.8-Flash-Next launches on gfx950: the buffers, the per-step pointer
-tables and the launch sequence of a verify.
+tables and the launch sequence of a verify (and of an MTP draft step).
 
 A verify of R requests x L tokens is 13 launches: layer 0 behind the prelude (the
 token embedding and the n-gram history), layers 1-3 with layer 1's PLE in front,
@@ -27,6 +27,7 @@ from __future__ import annotations
 import inspect
 import os
 from pathlib import Path
+from typing import Optional
 
 import torch
 
@@ -65,6 +66,8 @@ SGLANG_READS = {
     ),
     "srt/model_executor/forward_batch_info.py": (
         "forward_mode",
+        "is_draft_extend_v2",
+        "is_decode",
         "batch_size",
         "input_ids",
         "positions",
@@ -129,7 +132,7 @@ PLE_LAUNCH = 1  # the launch whose first layer (1) carries the PLE
 
 
 class _Base:
-    """The buffers a runner holds: scratch mailboxes, the epoch, the tables."""
+    """The buffers both runners share: scratch mailboxes, the epoch, the tables."""
 
     def __init__(self, device, eos_token_id: int, fault):
         ensure_writable_flydsl_cache()
@@ -542,3 +545,152 @@ class VerifyRunner(_Base):
             h = out
         self.epoch[:1].add_(1)
         return self.x_buf[:S], h[:S]
+
+
+class DraftRunner(_Base):
+    """MTP (NEXTN) draft steps of R <= ``max_reqs`` requests, one launch each: the
+    input fusion, the QSA layer and the draft's mixer. A draft extend runs R x
+    ``ntok_extend`` rows, a draft decode step R x 1."""
+
+    def __init__(
+        self,
+        *,
+        views: dict,
+        embed_w: torch.Tensor,
+        cos_sin,
+        layer_id: int,
+        ntok_extend: int,
+        max_reqs: int,
+        eos_token_id: int,
+        device,
+        fault=None,
+    ):
+        super().__init__(device, eos_token_id, fault)
+        self.views, self.embed_w, self.cos_sin = views, embed_w, cos_sin
+        self.layer_id = layer_id
+        self.L_ext, self.max_reqs = int(ntok_extend), int(max_reqs)
+        S = self.max_reqs * self.L_ext
+        nbytes = max(
+            LY.scratch_layout(1 + 2, r * t, r)[1]
+            for r in range(1, self.max_reqs + 1)
+            for t in (1, self.L_ext)
+        )
+        self.scratch = torch.zeros(nbytes // 4, dtype=torch.int32, device=device)
+        bf16 = dict(dtype=torch.bfloat16, device=device)
+        self.x_buf = torch.empty(S, HIDDEN, **bf16)
+        # draft step i + 1 reads step i's output: a step writes the buffer its
+        # input does not overlap, chosen by address so a capture repeats warmup
+        self.hc_bufs = [torch.empty(S, HC_DIM, **bf16) for _ in range(2)]
+        # a chain step's input_ids is a new tensor each step (topk_index.flatten()):
+        # the launch reads a copy at a fixed address, so the tables a warmup built
+        # are the ones its graph capture finds
+        self.ids_buf = torch.zeros(S, dtype=torch.int64, device=device)
+        # hidden states that are not a previous step's output are read from a copy
+        # at a fixed address: with rejection sampling a chain step's hidden states
+        # are a new tensor each step (select_top_k_tokens indexes them), and a
+        # graph capture allocates it at another address than its warmup
+        self.hin_buf = torch.zeros(S, HC_DIM, **bf16)
+        self.ssq_buf = torch.zeros(S, 4, LY.NPART, dtype=torch.float32, device=device)
+        # a QSA-only launch reads no mamba slot
+        self.mamba_map = torch.zeros(4096, dtype=torch.int32, device=device)
+
+    def prepare_step(self, fb, hidden_states: torch.Tensor):
+        from sglang.srt.model_executor.forward_context import (
+            get_req_to_token_pool,
+            get_token_to_kv_pool,
+        )
+
+        rtp, kvp = get_req_to_token_pool(), get_token_to_kv_pool()
+        R, S = int(fb.batch_size), int(fb.input_ids.numel())
+        cos = self.cos_sin()
+        key = (
+            R,
+            S,
+            fb.positions.data_ptr(),
+            fb.out_cache_loc.data_ptr(),
+            fb.req_pool_indices.data_ptr(),
+            fb.seq_lens.data_ptr(),
+            hidden_states.data_ptr(),
+            cos.data_ptr(),
+        )
+        got = self._cached(key)
+        if got is not None:
+            return got
+        no_capture("building the pointer tables")
+        self._hold(cos)
+        reasons = _step_reasons(fb, R, S // R) + qsa_cache_reasons(kvp, self.layer_id)
+        if reasons:
+            raise ValueError("Qwen3.8-Flash-Next monokernel: " + "; ".join(reasons))
+        g = packing.global_ptr_row(
+            fb.positions,
+            fb.out_cache_loc,
+            fb.req_pool_indices,
+            fb.seq_lens,
+            rtp.req_to_token,
+            cos,
+            kvp.qsa_rope_position_buffer,
+            self.mamba_map,
+        )
+        g[LY.G_INPUT_IDS] = self.ids_buf.data_ptr()
+        g[LY.G_EMBED_W] = self.embed_w.data_ptr()
+        g[LY.G_MTP_HIN] = hidden_states.data_ptr()
+        g[LY.G_FIN_OUT] = self.x_buf.data_ptr()
+        g[LY.G_HOUT_SSQ] = self.ssq_buf.data_ptr()
+        rows = packing.mtp_rows(self.views, *_qsa_buffers(kvp, self.layer_id), g)
+        pos = fb.positions
+        build = self._build_key(
+            plan="qsa",
+            nreq=R,
+            ntok=S // R,
+            rtt_stride=rtp.req_to_token.stride(0),
+            pos_stride=pos.stride(0) if pos.dim() == 2 else 0,
+            final_mix=True,
+            first_src="mtp",
+        )
+        return self._keep(key, (self._upload(rows), build))
+
+    def launch(self, fb, hidden_states: torch.Tensor):
+        """A draft step -> (the draft mixer's output x [S, HIDDEN], the
+        hyper-connection hidden states [S, HC_DIM])."""
+        S = int(fb.input_ids.numel())
+        if not any(_overlaps(b, hidden_states) for b in self.hc_bufs):
+            self.hin_buf[:S].copy_(hidden_states)
+            hidden_states = self.hin_buf[:S]
+        table, build = self.prepare_step(fb, hidden_states)
+        hc = self.hc_bufs[1 if _overlaps(self.hc_bufs[0], hidden_states) else 0]
+        self.ids_buf[:S].copy_(fb.input_ids.view(-1))
+        self.kernel(build)(
+            0,
+            hc.data_ptr(),
+            table.data_ptr(),
+            self.scratch.data_ptr(),
+            self.epoch.data_ptr(),
+            0,
+            stream=torch.cuda.current_stream(),
+        )
+        self.epoch[:1].add_(1)
+        return self.x_buf[:S], hc[:S]
+
+
+def _overlaps(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Whether two tensors' memory ranges overlap."""
+    a0, b0 = a.data_ptr(), b.data_ptr()
+    a1 = a0 + a.numel() * a.element_size()
+    b1 = b0 + b.numel() * b.element_size()
+    return a0 < b1 and b0 < a1
+
+
+def draft_eligible(fb, hidden_states: Optional[torch.Tensor], L_ext: int, max_reqs: int) -> bool:  # fmt: skip
+    """A draft step the launch takes: R <= ``max_reqs`` whole requests, a draft
+    extend of ``L_ext`` rows each or a draft decode of one, on the target's bf16
+    hyper-connection hidden states."""
+    R = int(fb.batch_size)
+    hs = hidden_states
+    if not 1 <= R <= max_reqs or hs is None:
+        return False
+    if hs.dtype != torch.bfloat16 or hs.shape[-1] != HC_DIM or not hs.is_contiguous():
+        return False
+    n = int(fb.input_ids.numel())
+    if fb.forward_mode.is_draft_extend_v2():
+        return n == R * L_ext and hs.shape[0] == n
+    return fb.forward_mode.is_decode() and n == R and hs.shape[0] == R
