@@ -130,38 +130,22 @@ def _small(kind: str, ple: bool) -> dict:
     t = {}
     for hc in _HC_NAMES:
         t.update({k: (k, *v) for k, v in _hc_tensors(hc).items()})
-    t["mlp.gate.weight"] = ("mlp.gate.weight", (N_EXPERTS, HIDDEN), (_BF16,))
-    t["mlp.shared_expert_gate.weight"] = (
-        "mlp.shared_expert_gate.weight",
-        (1, HIDDEN),
-        (_BF16,),
-    )
+    for name, rows in (("gate", N_EXPERTS), ("shared_expert_gate", 1)):
+        t[f"mlp.{name}.weight"] = (f"mlp.{name}.weight", (rows, HIDDEN), (_BF16,))
     if kind == "gdn":
         # A_log, dt_bias and the gated norm are read as f32 (the packers convert)
         t["linear_attn.A_log"] = ("linear_attn.A_log", (GDN_HV,), (_BF16, _F32))
         t["linear_attn.dt_bias"] = ("linear_attn.dt_bias", (GDN_HV,), (_BF16, _F32))
         t["linear_attn.norm.weight"] = ("linear_attn.norm.weight", (128,), (_BF16, _F32))  # fmt: skip
-        t["linear_attn.conv1d.weight"] = (
-            "linear_attn.conv1d.weight",
-            (GDN_CONV_DIM, 1, 4),
-            (_BF16,),
-        )
+        t["linear_attn.conv1d.weight"] = ("linear_attn.conv1d.weight", (GDN_CONV_DIM, 1, 4), (_BF16,))  # fmt: skip
     else:
-        for ck, sg, n in (
-            ("self_attn.q_norm.weight", "q_norm.weight", 256),
-            ("self_attn.k_norm.weight", "k_norm.weight", 256),
-            (
-                "self_attn.indexer.q_layernorm.weight",
-                "indexer.q_layernorm.weight",
-                128,
-            ),  # fmt: skip
-            (
-                "self_attn.indexer.k_layernorm.weight",
-                "indexer.k_layernorm.weight",
-                128,
-            ),  # fmt: skip
+        for sg, n in (
+            ("q_norm.weight", 256),
+            ("k_norm.weight", 256),
+            ("indexer.q_layernorm.weight", 128),
+            ("indexer.k_layernorm.weight", 128),
         ):
-            t[ck] = (sg, (n,), (_BF16,))
+            t["self_attn." + sg] = (sg, (n,), (_BF16,))
     if ple:
         for name, shape in (
             ("key_proj.weight", (HC_DIM, HIDDEN)),
@@ -391,15 +375,16 @@ def layer_views(layer, i: int, kind: str, copies: dict, params: set) -> dict:
     return views
 
 
-def mixer_views(mixer, copies: dict, params: set) -> dict:
+def mixer_views(mixer, copies: dict, params: set, what="final mixer packed") -> dict:
     """The model-level hyper-connection mixer, packed (no combine: its gate tile is
     zero)."""
-    views = {
-        "norm": mixer.hc_norm.weight.data.contiguous(),
-        "down": packing.pack_hc_down(mixer.input_mix_weight_down.weight.data),
-        "up": packing.pack_bf16(mixer.input_mix_weight_up.weight.data.contiguous()),
-    }
-    _log_copies(copies, "final mixer packed", (), views, params)
+    views = packing.pack_mixer(
+        *(
+            _get(mixer, f"{n}.weight")
+            for n in ("hc_norm", "input_mix_weight_down", "input_mix_weight_up")
+        )
+    )
+    _log_copies(copies, what, (), views, params)
     return views
 
 
@@ -470,15 +455,14 @@ def mtp_reasons(lm) -> list[str]:
 
 
 def mtp_views(lm, copies: dict, params: set) -> dict:
-    """The MTP draft's packed views (``packing.pack_mtp``)."""
+    """The MTP draft's packed views: its QSA layer, input fusion and mixer."""
     layer = lm.model.layers[0]
-    lw = {f"layers.0.{k}": v for k, v in checkpoint_dict(layer, "qsa", False).items()}
-    lw.update({name: _get(lm, name) for name in _MTP_FUSION})
-    mixer = lm.model.hyper_connection_mixer
-    for name in ("hc_norm", "input_mix_weight_down", "input_mix_weight_up"):
-        lw[f"hyper_connection_mixer.{name}.weight"] = _get(mixer, f"{name}.weight")
-    views = packing.pack_mtp(
-        lw, moe=moe_params(layer.mlp.experts), proj=proj_params(layer, QSA_PROJ)
-    )
+    lw = checkpoint_dict(layer, "qsa", False)
+    moe, proj = moe_params(layer.mlp.experts), proj_params(layer, QSA_PROJ)
+    views = {
+        "layer": packing.pack_qsa_layer(lw, moe=moe, proj=proj),
+        **packing.pack_fusion({name: _get(lm, name) for name in _MTP_FUSION}),
+    }
     _log_copies(copies, "mtp packed", (), views, params)
+    views["final"] = mixer_views(lm.model.hyper_connection_mixer, copies, params, "mtp packed final")  # fmt: skip
     return views

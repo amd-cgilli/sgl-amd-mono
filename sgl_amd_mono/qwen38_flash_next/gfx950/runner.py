@@ -190,6 +190,22 @@ class _Base:
     def _upload(self, rows: list) -> torch.Tensor:
         return torch.tensor(rows, dtype=torch.int64).to(self.device)
 
+    def _prepare(self, key, cos, reasons, build):
+        """The tables of step ``key``: built once (``build()``) unless ``reasons()``."""
+        got = self._cached(key)
+        if got is not None:
+            return got
+        no_capture("building the pointer tables")
+        self._hold(cos)
+        why = reasons()
+        if why:
+            raise ValueError("Qwen3.8-Flash-Next monokernel: " + "; ".join(why))
+        return self._keep(key, build())
+
+    def _run(self, key, h_in: int, h_out: int, table, launch_id: int, stream) -> None:
+        ptrs = (table.data_ptr(), self.scratch.data_ptr(), self.epoch.data_ptr())
+        self.kernel(key)(h_in, h_out, *ptrs, launch_id, stream=stream)
+
     def _build_key(self, **kw) -> MonoBuild:
         return MonoBuild(
             eos_token_id=self.eos_token_id,
@@ -212,6 +228,16 @@ def _step_reasons(fb, R: int, L: int) -> list[str]:
     if fb.input_ids.numel() != R * L:
         reasons.append(f"{fb.input_ids.numel()} rows for {R} requests x {L} tokens")
     return reasons
+
+
+def _strides(fb, rtp) -> dict:
+    """The build keys' req_to_token row stride and MRoPE axis stride (1-D text
+    positions: the three axes read the same element)."""
+    pos = fb.positions
+    return dict(
+        rtt_stride=rtp.req_to_token.stride(0),
+        pos_stride=pos.stride(0) if pos.dim() == 2 else 0,
+    )
 
 
 def _qsa_buffers(kvp, layer_id: int):
@@ -276,10 +302,8 @@ class VerifyRunner(_Base):
         self.scratch = torch.zeros(nbytes // 4, dtype=torch.int32, device=device)
         bf16 = dict(dtype=torch.bfloat16, device=device)
         self.h_bufs = [torch.empty(S, HC_DIM, **bf16) for _ in range(2)]
-        self.ssq_bufs = [
-            torch.zeros(S, 4, LY.NPART, dtype=torch.float32, device=device)
-            for _ in range(2)
-        ]
+        f32 = dict(dtype=torch.float32, device=device)
+        self.ssq_bufs = [torch.zeros(S, 4, LY.NPART, **f32) for _ in range(2)]
         self.emb_buf = torch.empty(S, HIDDEN, **bf16)
         self.x_buf = torch.empty(S, HIDDEN, **bf16)
 
@@ -293,7 +317,6 @@ class VerifyRunner(_Base):
                 ntok=self.L,
                 ple_first=i == PLE_LAUNCH,
                 final_mix=i == last,
-                prelude=i == 0,
                 first_src="embed" if i == 0 else "global",
                 **meta,
             )
@@ -321,16 +344,17 @@ class VerifyRunner(_Base):
             cos.data_ptr(),
             rtp.req_to_token.data_ptr(),
         )
-        got = self._cached(key)
-        if got is not None:
-            return got
-        no_capture("building the pointer tables")
-        self._hold(cos)
-        reasons = _step_reasons(fb, R, self.L) + self.cache_reasons(rtp, kvp, R)
-        if reasons:
-            raise ValueError("Qwen3.8-Flash-Next monokernel: " + "; ".join(reasons))
-        tables, meta = self._tables_for(fb, rtp, kvp, cos, R)
-        return self._keep(key, (tables, self.keys(R, meta)))
+
+        def build():
+            tables, meta = self._tables_for(fb, rtp, kvp, cos, R)
+            return tables, self.keys(R, meta)
+
+        return self._prepare(
+            key,
+            cos,
+            lambda: _step_reasons(fb, R, self.L) + self.cache_reasons(rtp, kvp, R),
+            build,
+        )
 
     def cache_reasons(self, rtp, kvp, R: int) -> list[str]:
         """What the kernel assumes of SGLang's caches for a verify of R requests:
@@ -441,14 +465,7 @@ class VerifyRunner(_Base):
 
         def global_row(launch: int) -> list:
             g = packing.global_ptr_row(
-                fb.positions,
-                fb.out_cache_loc,
-                fb.req_pool_indices,
-                fb.seq_lens,
-                rtp.req_to_token,
-                cos,
-                kvp.qsa_rope_position_buffer,
-                mamba_map,
+                fb, rtp.req_to_token, cos, kvp.qsa_rope_position_buffer, mamba_map
             )
             g[LY.G_PLE_EMB] = self.emb_buf.data_ptr()
             g[LY.G_FIN_OUT] = self.x_buf.data_ptr()
@@ -466,11 +483,7 @@ class VerifyRunner(_Base):
             return g
 
         last = self.layers[len(self.kinds) - 1]
-        frow = [0] * LY.N_PTR
-        frow[LY.P_HCA_NORM] = self.final["norm"].data_ptr()
-        frow[LY.P_HCA_DOWN] = self.final["down"].data_ptr()
-        frow[LY.P_HCA_UP] = self.final["up"].data_ptr()
-        frow[LY.P_HCA_INJ] = last["hca"]["inj"].data_ptr()  # its combine gate is unused
+        frow = packing.final_row(self.final, last["hca"]["inj"])
         iconv = issm_row = ple_ist_row = ssm_bf16 = None
         tables = []
         for li, (_, layer_ids) in enumerate(self.plans):
@@ -508,11 +521,8 @@ class VerifyRunner(_Base):
             if li == len(self.plans) - 1:
                 rows.append(frow)
             tables.append(self._upload(rows))
-        pos = fb.positions
         meta = dict(
-            rtt_stride=rtp.req_to_token.stride(0),
-            # 1-D text positions: all three MRoPE axes read the same element
-            pos_stride=pos.stride(0) if pos.dim() == 2 else 0,
+            _strides(fb, rtp),
             map_i64=mamba_map.dtype == torch.int64,
             iconv=ConvStrides(*iconv),
             issm_row=issm_row,
@@ -533,15 +543,7 @@ class VerifyRunner(_Base):
         h = self.h_bufs[1]  # unused by the prelude launch, which embeds the tokens
         for i, key in enumerate(keys):
             out = self.h_bufs[i % 2]
-            self.kernel(key)(
-                h.data_ptr(),
-                out.data_ptr(),
-                tables[i].data_ptr(),
-                self.scratch.data_ptr(),
-                self.epoch.data_ptr(),
-                i,
-                stream=stream,
-            )
+            self._run(key, h.data_ptr(), out.data_ptr(), tables[i], i, stream)
             h = out
         self.epoch[:1].add_(1)
         return self.x_buf[:S], h[:S]
@@ -613,41 +615,35 @@ class DraftRunner(_Base):
             hidden_states.data_ptr(),
             cos.data_ptr(),
         )
-        got = self._cached(key)
-        if got is not None:
-            return got
-        no_capture("building the pointer tables")
-        self._hold(cos)
-        reasons = _step_reasons(fb, R, S // R) + qsa_cache_reasons(kvp, self.layer_id)
-        if reasons:
-            raise ValueError("Qwen3.8-Flash-Next monokernel: " + "; ".join(reasons))
-        g = packing.global_ptr_row(
-            fb.positions,
-            fb.out_cache_loc,
-            fb.req_pool_indices,
-            fb.seq_lens,
-            rtp.req_to_token,
+
+        def build():
+            g = packing.global_ptr_row(
+                fb, rtp.req_to_token, cos, kvp.qsa_rope_position_buffer, self.mamba_map
+            )
+            g[LY.G_INPUT_IDS] = self.ids_buf.data_ptr()
+            g[LY.G_EMBED_W] = self.embed_w.data_ptr()
+            g[LY.G_MTP_HIN] = hidden_states.data_ptr()
+            g[LY.G_FIN_OUT] = self.x_buf.data_ptr()
+            g[LY.G_HOUT_SSQ] = self.ssq_buf.data_ptr()
+            rows = packing.mtp_rows(self.views, *_qsa_buffers(kvp, self.layer_id), g)
+            build_key = self._build_key(
+                plan="qsa",
+                nreq=R,
+                ntok=S // R,
+                final_mix=True,
+                first_src="mtp",
+                **_strides(fb, rtp),
+            )
+            return self._upload(rows), build_key
+
+        return self._prepare(
+            key,
             cos,
-            kvp.qsa_rope_position_buffer,
-            self.mamba_map,
+            lambda: (
+                _step_reasons(fb, R, S // R) + qsa_cache_reasons(kvp, self.layer_id)
+            ),
+            build,
         )
-        g[LY.G_INPUT_IDS] = self.ids_buf.data_ptr()
-        g[LY.G_EMBED_W] = self.embed_w.data_ptr()
-        g[LY.G_MTP_HIN] = hidden_states.data_ptr()
-        g[LY.G_FIN_OUT] = self.x_buf.data_ptr()
-        g[LY.G_HOUT_SSQ] = self.ssq_buf.data_ptr()
-        rows = packing.mtp_rows(self.views, *_qsa_buffers(kvp, self.layer_id), g)
-        pos = fb.positions
-        build = self._build_key(
-            plan="qsa",
-            nreq=R,
-            ntok=S // R,
-            rtt_stride=rtp.req_to_token.stride(0),
-            pos_stride=pos.stride(0) if pos.dim() == 2 else 0,
-            final_mix=True,
-            first_src="mtp",
-        )
-        return self._keep(key, (self._upload(rows), build))
 
     def launch(self, fb, hidden_states: torch.Tensor):
         """A draft step -> (the draft mixer's output x [S, HIDDEN], the
@@ -659,15 +655,7 @@ class DraftRunner(_Base):
         table, build = self.prepare_step(fb, hidden_states)
         hc = self.hc_bufs[1 if _overlaps(self.hc_bufs[0], hidden_states) else 0]
         self.ids_buf[:S].copy_(fb.input_ids.view(-1))
-        self.kernel(build)(
-            0,
-            hc.data_ptr(),
-            table.data_ptr(),
-            self.scratch.data_ptr(),
-            self.epoch.data_ptr(),
-            0,
-            stream=torch.cuda.current_stream(),
-        )
+        self._run(build, 0, hc.data_ptr(), table, 0, torch.cuda.current_stream())
         self.epoch[:1].add_(1)
         return self.x_buf[:S], hc[:S]
 
@@ -680,17 +668,25 @@ def _overlaps(a: torch.Tensor, b: torch.Tensor) -> bool:
     return a0 < b1 and b0 < a1
 
 
+def draft_shaped(fb, L_ext: int, max_reqs: int) -> bool:
+    """A draft extend of R x ``L_ext`` rows or a draft decode of R x 1, R <= max."""
+    R, n, mode = int(fb.batch_size), int(fb.input_ids.numel()), fb.forward_mode
+    if not 1 <= R <= max_reqs:
+        return False
+    return (mode.is_draft_extend_v2() and n == R * L_ext) or (
+        mode.is_decode() and n == R
+    )
+
+
 def draft_eligible(fb, hidden_states: Optional[torch.Tensor], L_ext: int, max_reqs: int) -> bool:  # fmt: skip
-    """A draft step the launch takes: R <= ``max_reqs`` whole requests, a draft
-    extend of ``L_ext`` rows each or a draft decode of one, on the target's bf16
-    hyper-connection hidden states."""
-    R = int(fb.batch_size)
+    """A draft step the launch takes: draft-shaped, on the target's bf16
+    hyper-connection hidden states of its rows."""
     hs = hidden_states
-    if not 1 <= R <= max_reqs or hs is None:
-        return False
-    if hs.dtype != torch.bfloat16 or hs.shape[-1] != HC_DIM or not hs.is_contiguous():
-        return False
-    n = int(fb.input_ids.numel())
-    if fb.forward_mode.is_draft_extend_v2():
-        return n == R * L_ext and hs.shape[0] == n
-    return fb.forward_mode.is_decode() and n == R and hs.shape[0] == R
+    return (
+        draft_shaped(fb, L_ext, max_reqs)
+        and hs is not None
+        and hs.dtype == torch.bfloat16
+        and hs.shape[-1] == HC_DIM
+        and hs.is_contiguous()
+        and hs.shape[0] == int(fb.input_ids.numel())
+    )

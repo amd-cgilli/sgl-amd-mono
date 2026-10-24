@@ -373,39 +373,28 @@ def test_the_recipe_is_accepted():
     assert _config_reasons(cfg=_replace(CFG, context_length=131072)) == []
 
 
+def _text(**changes):
+    return _replace(VL, text_config=_replace(TEXT, **changes))
+
+
+UNSUPPORTED = {
+    "hidden size": (CFG, _text(hidden_size=4096), True),
+    "experts": (CFG, _text(num_experts=256), True),
+    "index budget": (CFG, _text(indexer_budget=1024), True),
+    "layer pattern": (CFG, _text(layer_types=["linear_attention"] * 48), True),
+    "quantization": (
+        CFG,
+        _replace(VL, quantization_config={"quant_method": "fp8"}),
+        True,
+    ),
+    "ssm dtype": (CFG, _text(mamba_ssm_dtype="float16"), True),
+    "context": (_replace(CFG, context_length=MAX_CTX), VL, True),
+    "no flydsl": (CFG, VL, False),
+}
+
+
 @pytest.mark.parametrize(
-    "cfg, hf_config, flydsl",
-    [
-        (CFG, _replace(VL, text_config=_replace(TEXT, hidden_size=4096)), True),
-        (CFG, _replace(VL, text_config=_replace(TEXT, num_experts=256)), True),
-        (CFG, _replace(VL, text_config=_replace(TEXT, indexer_budget=1024)), True),
-        (
-            CFG,
-            _replace(
-                VL,
-                text_config=_replace(TEXT, layer_types=["linear_attention"] * 48),
-            ),
-            True,
-        ),
-        (CFG, _replace(VL, quantization_config={"quant_method": "fp8"}), True),
-        (
-            CFG,
-            _replace(VL, text_config=_replace(TEXT, mamba_ssm_dtype="float16")),
-            True,
-        ),
-        (_replace(CFG, context_length=MAX_CTX), VL, True),
-        (CFG, VL, False),
-    ],
-    ids=[
-        "hidden size",
-        "experts",
-        "index budget",
-        "layer pattern",
-        "quantization",
-        "ssm dtype",
-        "context",
-        "no flydsl",
-    ],
+    "cfg, hf_config, flydsl", UNSUPPORTED.values(), ids=UNSUPPORTED
 )
 def test_each_unsupported_setting_is_one_reason(cfg, hf_config, flydsl):
     assert len(_config_reasons(cfg=cfg, hf_config=hf_config, flydsl=flydsl)) == 1
@@ -413,8 +402,7 @@ def test_each_unsupported_setting_is_one_reason(cfg, hf_config, flydsl):
 
 def test_the_ple_layer_is_one_reason():
     # PLE on layer 1 (ple_layer_ids counts from 1) is built into the second launch
-    text = _replace(TEXT, ple_layer_ids=[2, 6])
-    assert len(_config_reasons(hf_config=_replace(VL, text_config=text))) == 1
+    assert len(_config_reasons(hf_config=_text(ple_layer_ids=[2, 6]))) == 1
 
 
 def test_the_recipe_routes_verify_batches_of_one_to_eight():
@@ -483,17 +471,19 @@ def test_a_build_key_reaches_the_jit_cache_key():
     assert {key: 1}[MonoBuild(plan="gdn,gdn,gdn,qsa", nreq=8, ntok=4, rtt_stride=262208)]  # fmt: skip
 
 
-@pytest.mark.parametrize(
-    "kw",
-    [
-        dict(plan="gdn,mla", nreq=1, ntok=4),
-        dict(plan="", nreq=1, ntok=4),
-        dict(plan="qsa", nreq=9, ntok=1),
-        dict(plan="qsa", nreq=1, ntok=5),
-        dict(plan="qsa", nreq=8, ntok=4, first_src="hidden"),
-    ],
-    ids=["kind", "empty", "requests", "tokens", "first source"],
-)
+OUT_OF_RANGE = {
+    "kind": dict(plan="gdn,mla", nreq=1, ntok=4),
+    "empty": dict(plan="", nreq=1, ntok=4),
+    "requests": dict(plan="qsa", nreq=9, ntok=1),
+    "tokens": dict(plan="qsa", nreq=1, ntok=5),
+    "first source": dict(plan="qsa", nreq=8, ntok=4, first_src="hidden"),
+    "PLE behind the MTP fusion": dict(
+        plan="qsa", nreq=1, ntok=4, ple_first=True, first_src="mtp"
+    ),
+}
+
+
+@pytest.mark.parametrize("kw", OUT_OF_RANGE.values(), ids=OUT_OF_RANGE)
 def test_a_build_key_out_of_the_kernels_range_is_refused(kw):
     with pytest.raises(ValueError):
         MonoBuild(**kw)
@@ -626,44 +616,39 @@ def test_the_views_accept_the_layers():
     assert weights.mixer_reasons(_hc()) == []
 
 
-@pytest.mark.parametrize(
-    "kind, changes",
-    [
-        ("gdn", {"mlp.experts.num_fused_shared_experts": 0}),
-        (
-            "gdn",
-            {
-                "mlp.experts.w13_weight": _meta(
-                    513, 1536, 1280, dtype=torch.uint8, is_shuffled=False
-                )
-            },
-        ),
-        ("gdn", {"mlp.experts.moe_runner_config": SimpleNamespace(activation="situ")}),
-        ("gdn", {"mlp.experts.w2_weight_scale": _meta(513, 2560, 24)}),
-        ("gdn", {"linear_attn.out_proj": _fp8(2560, 6144, scale=False)}),
-        ("gdn", {"linear_attn.in_proj_ba": _fp8(256, 2560)}),
-        ("gdn", {"linear_attn.in_proj_qkvz": _w(16384, 2560)}),
-        ("gdn", {"linear_attn.conv1d": _w(10240, 4)}),
-        ("gdn", {"attn_hyper_connection.hc_norm": _w(10240, dtype=torch.float32)}),
-        ("qsa", {"indexer.index_qk_proj": _fp8(640, 1280)}),
-        ("qsa", {"q_norm": _w(128)}),
-        ("qsa", {"mlp.gate": _w(256, 2560)}),
-    ],
-    ids=[
-        "no fused shared expert",
-        "unshuffled experts",
-        "interleaved gate and up",
-        "2-byte scales",
-        "dequantized projection",
-        "wide b / a projection",
-        "bf16 projection",
-        "conv weight",
-        "f32 norm",
-        "index projection",
-        "q norm",
-        "router",
-    ],
-)
+REFUSED_VIEWS = {
+    "no fused shared expert": ("gdn", {"mlp.experts.num_fused_shared_experts": 0}),
+    "unshuffled experts": (
+        "gdn",
+        {
+            "mlp.experts.w13_weight": _meta(
+                513, 1536, 1280, dtype=torch.uint8, is_shuffled=False
+            )
+        },
+    ),
+    "interleaved gate and up": (
+        "gdn",
+        {"mlp.experts.moe_runner_config": SimpleNamespace(activation="situ")},
+    ),
+    "2-byte scales": ("gdn", {"mlp.experts.w2_weight_scale": _meta(513, 2560, 24)}),
+    "dequantized projection": (
+        "gdn",
+        {"linear_attn.out_proj": _fp8(2560, 6144, scale=False)},
+    ),
+    "wide b / a projection": ("gdn", {"linear_attn.in_proj_ba": _fp8(256, 2560)}),
+    "bf16 projection": ("gdn", {"linear_attn.in_proj_qkvz": _w(16384, 2560)}),
+    "conv weight": ("gdn", {"linear_attn.conv1d": _w(10240, 4)}),
+    "f32 norm": (
+        "gdn",
+        {"attn_hyper_connection.hc_norm": _w(10240, dtype=torch.float32)},
+    ),
+    "index projection": ("qsa", {"indexer.index_qk_proj": _fp8(640, 1280)}),
+    "q norm": ("qsa", {"q_norm": _w(128)}),
+    "router": ("qsa", {"mlp.gate": _w(256, 2560)}),
+}
+
+
+@pytest.mark.parametrize("kind, changes", REFUSED_VIEWS.values(), ids=REFUSED_VIEWS)
 def test_each_unsupported_view_is_refused(kind, changes):
     assert len(weights.layer_reasons(_layer(kind, **changes), 3, kind)) == 1
 

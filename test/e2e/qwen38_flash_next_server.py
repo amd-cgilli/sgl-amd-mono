@@ -5,7 +5,7 @@ a request, 8 requests at the largest width: 32 rows).
 The cookbook's AMD recipe serves the BF16 / FP8 checkpoints at TP8; the launches
 run the whole model on one GPU, so these servers diverge from it in the TP size
 and the checkpoint (amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8). The flags
-are those the monokernel was measured with in SGLang (sgl-project/sglang#45353)."""
+are those the monokernel was measured with."""
 
 import os
 
@@ -20,21 +20,9 @@ ENV = {
     "SGLANG_USE_AITER_FP8_PER_TOKEN": "1",
 }
 # Without --monokernel-backend, so a test can launch the normal path too.
-ARGS = [
-    "--tp",
-    "1",
-    "--attention-backend",
-    "triton",
-    "--speculative-algorithm",
-    "NEXTN",
-    "--speculative-num-steps",
-    "3",
-    "--speculative-eagle-topk",
-    "1",
-    "--speculative-num-draft-tokens",
-    "4",
-    "--cuda-graph-max-bs-decode",
-    "8",
-    "--max-running-requests",
-    "16",
-]
+ARGS = (
+    "--tp 1 --attention-backend triton --speculative-algorithm NEXTN "
+    "--speculative-num-steps 3 --speculative-eagle-topk 1 "
+    "--speculative-num-draft-tokens 4 --cuda-graph-max-bs-decode 8 "
+    "--max-running-requests 16"
+).split()

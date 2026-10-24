@@ -19,7 +19,7 @@ pytestmark = pytest.mark.skipif(
 # parameters, so the served ones compile at the first forward
 STRIDES = {"rtt_stride": 262208, "pos_stride": 0, "eos_token_id": 248044}
 KINDS = {
-    "prelude": {"plan": "gdn", "prelude": True, "first_src": "embed"},
+    "prelude": {"plan": "gdn", "first_src": "embed"},
     "ple": {"plan": "gdn,gdn,qsa", "ple_first": True},
     "middle": {"plan": "gdn,gdn,gdn,qsa"},
     "final": {"plan": "gdn,gdn,gdn,qsa", "final_mix": True},

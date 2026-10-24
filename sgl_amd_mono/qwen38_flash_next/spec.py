@@ -3,14 +3,11 @@
 forward (RFC #43949).
 
 SGLang's runtime switches the model's forward at attach: a routed NEXTN verify
-step (1 to 8 requests x 4 tokens, one draft chain) runs ``_Built.forward`` here,
-which takes and returns what ``Qwen4ExpForConditionalGeneration.forward`` does.
-The whole model runs in 13 launches (``gfx950/runner.py``): layer 0 behind the
-prelude (the token embedding and the PLE n-gram history), layers 1-3 behind layer
-1's PLE, then 11 launches of 3 Gated DeltaNet + 1 QSA layers, the last followed by
-the model-level hyper-connection mixer. SGLang's logits processor closes the step,
-and the residual streams after the last layer are the hidden states the MTP draft
-reads, as SGLang's forward hands them on.
+step (1 to 8 requests x 4 tokens, one draft chain) runs ``_Built.forward``, which
+takes and returns what ``Qwen4ExpForConditionalGeneration.forward`` does. The
+whole model runs in 13 launches (``gfx950/runner.py``); SGLang's logits processor
+closes the step, and the residual streams after the last layer are the hidden
+states the MTP draft reads, as SGLang's forward hands them on.
 
 The kernels read SGLang's weights in place, except the copies logged at startup:
 the hyper-connection mixers and the router (with the shared expert's gate) packed
@@ -23,10 +20,7 @@ A request's verify rows write its draft tokens' KV, index keys and per-token
 GDN, PLE and n-gram states, as SGLang's verify does: request slot r owns row r of
 every verify scratch. A graph's pad rows write KV slot 0, the reserved dummy slot.
 
-``SGLANG_AMD_MONO_CHECK=1`` checks the weights the launches read of three layers
-against the checkpoint at build, then runs SGLang's own forward of every eager
-routed step first and logs the differences of the launches' logits and hidden
-states (``check.py``); the bounds in ``NUMERICS`` come from these runs.
+``SGLANG_AMD_MONO_CHECK=1``: ``check.py``; the bounds in ``NUMERICS`` come from it.
 """
 
 from __future__ import annotations
@@ -195,11 +189,10 @@ SGLANG_READS = {
 
 # The launches' logits and hidden states (the residual streams after the last
 # layer) against SGLang's forward of the same eager verify step (check mode), on
-# the step's worst row. The launches are bitwise salykova's in-tree kernel (534
-# steps, every launch's stream); the gap is SGLang's own noise: its AITER MXFP4 MoE
-# differs by about 2.6e-3 between two identical forwards, and 48 layers grow that
-# to a per-row logits rel of about 0.18 between two SGLang forwards of one step
-# (0.156 for the launches). The worst row of a step spreads wide, so the bounds
+# the step's worst row. The gap is SGLang's own noise: its AITER MXFP4 MoE differs
+# by about 2.6e-3 between two identical forwards, and 48 layers grow that to a
+# per-row logits rel of about 0.18 between two SGLang forwards of one step (0.156
+# for the launches). The worst row of a step spreads wide, so the bounds
 # catch row, slot or request mix-ups, garbage layouts and NaN, not a subtly wrong
 # layer. Worst row per step, median / p1 or p99 of 364 steps (bs 1-8, triton),
 # worst of 11,824 steps (triton and aiter), and of SGLang against itself (an input
@@ -272,7 +265,7 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
         )
     reasons += _context_reason(
         getattr(cfg, "context_length", None)
-        or getattr(t, "max_position_embeddings", None)  # fmt: skip
+        or getattr(t, "max_position_embeddings", None)
     )
     if not _has_flydsl():
         reasons.append("needs FlyDSL")

@@ -2,34 +2,26 @@
 """Qwen3.8-Flash-Next's MTP draft on gfx950: its spec and forward (RFC #43949).
 
 The NEXTN draft runs its own steps: a draft extend of R requests x 4 rows
-(DRAFT_EXTEND_V2) and the chain's draft decode steps of R x 1 (DECODE on the
-draft's runner). Monokernel API version 1 routes a draft model by the target's
-key, ("target_verify", R, draft tokens), which the draft never runs, so the spec
-routes the draft's own steps itself: at build, ``_route_draft_steps`` puts a
-wrapper in front of the model's forward, before the runtime installs its own
-over it. The wrapper routes a step by its forward mode, batch size, rows and
-hidden-state buffer alone, so a captured graph replays the decision made at
-capture, as a routed step does. It relies on every draft call site calling the
-instance attribute ``model.forward`` (pinned by a unit test), and does itself
-what the runtime does for a routed step, checking the draft's attention backend
-("qsa") once per step mode. It can move to SGLang if a later monokernel API
-routes a draft's own steps.
+(DRAFT_EXTEND_V2) and the chain's draft decode steps of R x 1. Monokernel API
+version 1 routes a draft model by the target's key, ("target_verify", R, draft
+tokens), which the draft never runs, so at build ``_route_draft_steps`` puts a
+wrapper in front of the model's forward, before the runtime installs its own over
+it. The wrapper routes a step by its forward mode, batch size, rows and
+hidden-state buffer alone (a captured graph replays the decision made at capture),
+relies on every draft call site calling the instance attribute ``model.forward``
+(pinned by a unit test), and checks the draft's attention backend ("qsa") once per
+step mode, as the runtime does for a routed step.
 
-SGLang's capture check never sees a draft step (the draft's graph runners run no
-capture tail hooks), so this module logs each draft key the first time it
-launches, and refuses, during graph capture, a step shaped like a draft step
-whose hidden states the launch cannot read, instead of letting the graph fall
-back silently. Check mode (``SGLANG_AMD_MONO_CHECK``) does not cover the draft
-yet, and fault injection arms the target's launches only.
+SGLang's capture check never sees a draft step, so this module logs each draft key
+the first time it launches, and refuses, during graph capture, a step shaped like a
+draft step whose hidden states the launch cannot read. Check mode does not cover
+the draft yet, and fault injection arms the target's launches only.
 
 A draft step is one launch (``gfx950/runner.DraftRunner``): the MTP input fusion
 (the token embedding and the target's hyper-connection hidden states, each
-normalized and projected), the QSA decoder layer and the draft's mixer. A draft
-extend runs R requests x 4 rows, a draft decode step R x 1, and ``_Draft.forward``
-returns what ``Qwen4ExpForCausalLMMTP.forward`` does. The weights are SGLang's,
-read in place, except the copies logged at startup: the hyper-connection mixers,
-router and input-fusion projections packed for the MFMA tiles, and the FP8
-projections SGLang keeps row-major, zero-padded in AITER's shuffle.
+normalized and projected), the QSA decoder layer and the draft's mixer;
+``_Draft.forward`` returns what ``Qwen4ExpForCausalLMMTP.forward`` does. The
+weights are SGLang's, read in place, except the copies logged at startup.
 """
 
 from __future__ import annotations
@@ -137,16 +129,6 @@ class _Draft:
         self.refused: set = set()
         self.backend_checked: set = set()
 
-    def _is_draft_shaped(self, fb) -> bool:
-        """A draft extend of R x L_ext rows or a draft decode of R x 1, R <= max."""
-        r, R = self.runner, int(fb.batch_size)
-        if not 1 <= R <= r.max_reqs:
-            return False
-        n, mode = int(fb.input_ids.numel()), fb.forward_mode
-        return (mode.is_draft_extend_v2() and n == R * r.L_ext) or (
-            mode.is_decode() and n == R
-        )
-
     def takes(self, forward_batch, input_embeds=None) -> bool:
         """Whether the launch runs this step: static properties of the step only
         (mode, batch size, rows, the hidden-state buffer), so graph-capture safe.
@@ -154,32 +136,33 @@ class _Draft:
         A step shaped like a draft step whose hidden states the launch cannot read
         is refused during graph capture (the graph would run the standard path
         for good) and logged once eagerly."""
-        from sgl_amd_mono.qwen38_flash_next.gfx950.runner import draft_eligible
+        from sgl_amd_mono.qwen38_flash_next.gfx950.runner import (
+            draft_eligible,
+            draft_shaped,
+        )
 
-        r, spec = self.runner, forward_batch.spec_info
+        r, fb, spec = self.runner, forward_batch, forward_batch.spec_info
         hidden = None if spec is None else spec.hidden_states
-        if input_embeds is None and draft_eligible(
-            forward_batch, hidden, r.L_ext, r.max_reqs
-        ):
+        if input_embeds is not None or not draft_shaped(fb, r.L_ext, r.max_reqs):
+            return False
+        if draft_eligible(fb, hidden, r.L_ext, r.max_reqs):
             return True
-        if input_embeds is None and self._is_draft_shaped(forward_batch):
-            fb = forward_batch
-            key = (fb.forward_mode.name, int(fb.batch_size), int(fb.input_ids.numel()))
-            what = (
-                "no hidden states"
-                if hidden is None
-                else f"hidden states {hidden.dtype} {tuple(hidden.shape)}"
-                f"{'' if hidden.is_contiguous() else ' (strided)'}"
-            )
-            why = (
-                f"Qwen3.8-Flash-Next MTP draft step {key} has {what}; the launch "
-                "reads contiguous bf16 [rows, hc] hidden states"
-            )
-            if _is_capturing():
-                raise ValueError(why + ": refusing to capture the standard path")
-            if key not in self.refused:
-                self.refused.add(key)
-                logger.warning("%s: this step runs the standard path", why)
+        key = (fb.forward_mode.name, int(fb.batch_size), int(fb.input_ids.numel()))
+        what = (
+            "no hidden states"
+            if hidden is None
+            else f"hidden states {hidden.dtype} {tuple(hidden.shape)}"
+            f"{'' if hidden.is_contiguous() else ' (strided)'}"
+        )
+        why = (
+            f"Qwen3.8-Flash-Next MTP draft step {key} has {what}; the launch "
+            "reads contiguous bf16 [rows, hc] hidden states"
+        )
+        if _is_capturing():
+            raise ValueError(why + ": refusing to capture the standard path")
+        if key not in self.refused:
+            self.refused.add(key)
+            logger.warning("%s: this step runs the standard path", why)
         return False
 
     def check_backend(self, forward_batch) -> None:

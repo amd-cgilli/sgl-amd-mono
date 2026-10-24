@@ -54,16 +54,16 @@ class MonoBuild(msgspec.Struct, frozen=True):
     ``nreq`` R requests of ``ntok`` L verify tokens; ``rtt_stride``: req_to_token
     row stride (int32 elements); ``pos_stride``: element stride between the 3
     MRoPE position axes (0: 1-D text positions); ``map_i64``: the request -> mamba
-    slot map is int64; ``ple_first``: the launch starts with layer 1's PLE;
-    ``final_mix``: it ends with the model-level mixer; ``prelude``: it embeds the
-    tokens (launch 0); ``iconv``, ``issm_row`` (elements per request row of
-    intermediate_ssm), ``ple_ist_row`` (bf16 elements per request row of the PLE
-    intermediate short-conv state) and ``ictx_row`` (int64 elements per request
-    row of the n-gram intermediate context): SGLang's verify scratch strides;
-    ``first_src``: where layer 0's input comes from (``global``: the previous
-    launch, ``mtp``: the MTP input fusion); ``ssm_bf16``: the GDN SSM states are
-    bf16 (SGLANG_MAMBA_SSM_DTYPE=bfloat16; the recurrence stays f32, the states
-    are rounded when stored, as SGLang does)."""
+    slot map is int64; ``ple_first``: the launch starts with layer 1's PLE (its
+    input is the previous launch's); ``final_mix``: it ends with the model-level
+    mixer; ``iconv``, ``issm_row`` (elements per request row of intermediate_ssm),
+    ``ple_ist_row`` (bf16 elements per request row of the PLE intermediate
+    short-conv state) and ``ictx_row`` (int64 elements per request row of the
+    n-gram intermediate context): SGLang's verify scratch strides; ``first_src``:
+    layer 0's input (``global``: the previous launch, ``embed``: the prelude, which
+    embeds the tokens, ``mtp``: the MTP input fusion); ``ssm_bf16``: the GDN SSM
+    states are bf16 (SGLANG_MAMBA_SSM_DTYPE=bfloat16; the recurrence stays f32,
+    the states are rounded when stored, as SGLang does)."""
 
     plan: str
     nreq: int
@@ -73,7 +73,6 @@ class MonoBuild(msgspec.Struct, frozen=True):
     map_i64: bool = False
     ple_first: bool = False
     final_mix: bool = False
-    prelude: bool = False
     eos_token_id: int = 0
     iconv: ConvStrides = msgspec.field(default_factory=ConvStrides)
     issm_row: int = 4 * GDN_HV * GDN_DK * GDN_DV
@@ -99,6 +98,8 @@ class MonoBuild(msgspec.Struct, frozen=True):
             raise ValueError(f"{self.nreq * self.ntok} rows, past {MAX_T}")
         if self.first_src not in ("global", "embed", "mtp"):
             raise ValueError(f"first_src {self.first_src!r}")
+        if self.ple_first and self.first_src != "global":
+            raise ValueError("a PLE launch reads the previous launch's streams")
 
     @property
     def layers(self) -> tuple:
