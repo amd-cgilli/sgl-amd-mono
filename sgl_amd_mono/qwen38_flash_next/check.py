@@ -2,11 +2,10 @@
 """SGLANG_AMD_MONO_CHECK=1: at build, the weights the launches read of three layers
 against the checkpoint's bytes (``weights``); then (eager steps only) every routed
 verify step also runs SGLang's own forward of the step first, on the caches as they
-were, and the
-launches' outputs are checked against it: the logits and the hidden states (the
-residual streams after the last layer, which the MTP draft reads), each against
-its ``spec.NUMERICS`` bound, on the worst row. Every check is logged; a miss is
-logged as a violation.
+were, and the launches' outputs are checked against it: the logits and the hidden
+states (the residual streams after the last layer, which the MTP draft reads), each
+against its ``spec.NUMERICS`` bound, on the worst row. Every check is logged; a miss
+is logged as a violation.
 
 The 13 launches run the whole model, so the check covers the step, not a layer.
 Both forwards write the same cache rows (the draft tokens' KV, index keys and
@@ -122,8 +121,8 @@ def compare(ref: dict, out, forward_batch) -> None:
 # projection the kernel reads merges (kernel name -> checkpoint names in the layer)
 PREFIX = "model.language_model."
 CHECKED_LAYERS = {0: "gdn", 1: "gdn", 3: "qsa"}  # a GDN, the PLE and a QSA layer
-CHECKED_EXPERTS = (0, 255, 511, 512)  # 512: the fused shared expert
-N_EXPERTS_FUSED = 513  # the routed experts and the fused shared expert
+SHARED_EXPERT = 512  # fused after the 512 routed experts
+CHECKED_EXPERTS = (0, 255, 511, SHARED_EXPERT)
 # keyed by layer kind: both kinds name their output projection "out"
 PROJ_SOURCES = {
     "gdn": {
@@ -141,7 +140,7 @@ PROJ_SOURCES = {
 
 def _checkpoint_dir() -> str:
     """The served checkpoint's directory: only its safetensors are read, so a
-    partial HF cache resolves (sgl-project/sglang#45353 at 57021d6e86)."""
+    partial HF cache resolves."""
     import os
 
     from sglang.srt.runtime_context import get_server_args
@@ -158,6 +157,10 @@ def _checkpoint_dir() -> str:
             allow_patterns=["*.safetensors", "*.safetensors.index.json"],
         )
     return path
+
+
+def _expert_name(e: int) -> str:
+    return "mlp.shared_expert" if e == SHARED_EXPERT else f"mlp.experts.{e}"
 
 
 def _load(path: str, names: list[str], device) -> dict:
@@ -183,7 +186,7 @@ def weights(model, kinds: list[str]) -> None:
     """Check mode, at build: the tensors the launches read of layers 0, 1 and 3
     (SGLang's params, its AITER-shuffled experts and FP8 projections un-shuffled)
     against the checkpoint's bytes. A layout SGLang changed would not fault, it
-    would produce plausible garbage; the measured kernel checked this at startup."""
+    would produce plausible garbage."""
     from sgl_amd_mono.qwen38_flash_next.gfx950 import packing
     from sgl_amd_mono.qwen38_flash_next.gfx950 import weights as views
 
@@ -197,9 +200,7 @@ def weights(model, kinds: list[str]) -> None:
         names = [p + k for k in small]
         names += [f"{p}{x}.{y}" for k in proj for x in PROJ_SOURCES[kind][k] for y in ("weight", "weight_scale")]  # fmt: skip
         for e in CHECKED_EXPERTS:
-            src = (
-                "mlp.shared_expert" if e == N_EXPERTS_FUSED - 1 else f"mlp.experts.{e}"
-            )
+            src = _expert_name(e)
             names += [f"{p}{src}.{w}_proj.{y}" for w in ("gate", "up", "down") for y in ("weight", "weight_scale")]  # fmt: skip
         ref = _load(path, names, layer.mlp.experts.w13_weight.device)
         bad = [
@@ -221,9 +222,7 @@ def weights(model, kinds: list[str]) -> None:
                 bad.append(k)
         moe = views.moe_params(layer.mlp.experts)
         for e in CHECKED_EXPERTS:
-            src = (
-                "mlp.shared_expert" if e == N_EXPERTS_FUSED - 1 else f"mlp.experts.{e}"
-            )
+            src = _expert_name(e)
             got = packing.unshuffle_moe_expert(moe, e)
             want = [
                 ref[f"{p}{src}.{w}_proj.{y}"].view(torch.uint8)

@@ -1,6 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# Adapted from sgl-project/sglang#45353 at 6ce98069c3 (Apache-2.0), by salykova:
-# python/sglang/kernels/ops/speculative/qwen4_exp_monokernel/pack.py
 """Host-side packing and pointer tables of the Qwen3.8-Flash-Next launches.
 
 The MXFP4 experts and the FP8 attention / GDN projections are SGLang's own params
@@ -52,12 +50,20 @@ def check_moe_params(m):
 
 
 def pack_hc_down(w_down, w_inj=None):
-    """Mix down weights [320, HC_DIM] + one extra 16-row tile whose rows 0..3 are the combine-gate (inject)
-    rows: the down GEMM of a K-slice also yields the gate partials."""
+    """Mix down weights [320, HC_DIM] + one extra 16-row tile whose rows 0..3 are the
+    combine-gate (inject) rows: the down GEMM of a K-slice also yields the gate
+    partials."""
     extra = torch.zeros(16, w_down.shape[1], dtype=w_down.dtype, device=w_down.device)
     if w_inj is not None:
         extra[: w_inj.shape[0]] = w_inj
     return pack_bf16(torch.cat([w_down, extra], dim=0).contiguous())
+
+
+def pack_router(lw):
+    """Router rows: the 512 routed logits, the shared-expert gate, 15 zero rows."""
+    gate, shared = lw["mlp.gate.weight"], lw["mlp.shared_expert_gate.weight"]
+    pad = torch.zeros(15, HIDDEN, dtype=torch.bfloat16, device=gate.device)
+    return pack_bf16(torch.cat([gate, shared, pad], dim=0).contiguous())
 
 
 def pack_hc(lw, name):
@@ -73,19 +79,12 @@ def pack_hc(lw, name):
 
 
 def pack_gdn_layer(lw, moe, proj):
-    """moe / proj: sglang's FusedMoE params / FP8 projection params {"ip", "out", "ba": (weight, scale)} of the
-    layer (AITER layouts, read in place)."""
+    """A GDN layer's views. moe / proj: SGLang's FusedMoE params / FP8 projection
+    params {"ip", "out", "ba": (weight, scale)} of the layer (AITER layouts, read in
+    place)."""
     a = "linear_attn."
     (ip, ip_s), (out, out_s), (ba, ba_s) = proj["ip"], proj["out"], proj["ba"]
-    router = torch.cat(
-        [
-            lw["mlp.gate.weight"],
-            lw["mlp.shared_expert_gate.weight"],
-            torch.zeros(15, HIDDEN, dtype=torch.bfloat16, device=ip.device),
-        ],
-        dim=0,
-    )
-    t = {
+    return {
         "hca": pack_hc(lw, "attn_hyper_connection"),
         "hcm": pack_hc(lw, "mlp_hyper_connection"),
         "ip": ip,
@@ -96,22 +95,20 @@ def pack_gdn_layer(lw, moe, proj):
         "norm_w": lw[a + "norm.weight"].float().contiguous(),
         "out": out,
         "out_s": out_s,
-        # b/a rows stay row-major FP8 (the GDN core dots them with the per-token FP8 activation) + their scales
+        # b/a rows stay row-major FP8 (the GDN core dots them with the per-token FP8
+        # activation)
         "ba": ba,
         "ba_s": ba_s,
-        "router": pack_bf16(router.contiguous()),
-        "moe": _moe(moe),
+        "router": pack_router(lw),
+        "moe": moe,
     }
-    return t
 
 
 def gdn_ptr_row(t, conv_state, ssm_state):
-    """Pointer table row for one GDN layer; conv/ssm state = base of the [slots, ...] pools of this layer."""
+    """Pointer table row of a GDN layer; conv / ssm state: the base of the layer's
+    [slots, ...] pools."""
     row = [0] * LY.N_PTR
-    row[LY.P_HCA_NORM] = t["hca"]["norm"].data_ptr()
-    row[LY.P_HCA_DOWN] = t["hca"]["down"].data_ptr()
-    row[LY.P_HCA_UP] = t["hca"]["up"].data_ptr()
-    row[LY.P_HCA_INJ] = t["hca"]["inj"].data_ptr()
+    _common_rows(row, t)
     row[LY.P_IP] = t["ip"].data_ptr()
     row[LY.P_CONV_W] = t["conv_w"].data_ptr()
     row[LY.P_NEG_A] = t["neg_a"].data_ptr()
@@ -120,15 +117,6 @@ def gdn_ptr_row(t, conv_state, ssm_state):
     row[LY.P_OUT] = t["out"].data_ptr()
     row[LY.P_CONV_STATE] = conv_state.data_ptr()
     row[LY.P_SSM_STATE] = ssm_state.data_ptr()
-    row[LY.P_HCM_NORM] = t["hcm"]["norm"].data_ptr()
-    row[LY.P_HCM_DOWN] = t["hcm"]["down"].data_ptr()
-    row[LY.P_HCM_UP] = t["hcm"]["up"].data_ptr()
-    row[LY.P_HCM_INJ] = t["hcm"]["inj"].data_ptr()
-    row[LY.P_ROUTER] = t["router"].data_ptr()
-    row[LY.P_GU] = t["moe"]["gu"].data_ptr()
-    row[LY.P_GU_S] = t["moe"]["gu_s"].data_ptr()
-    row[LY.P_DN] = t["moe"]["dn"].data_ptr()
-    row[LY.P_DN_S] = t["moe"]["dn_s"].data_ptr()
     row[LY.P_BA] = t["ba"].data_ptr()
     row[LY.P_IP_S] = t["ip_s"].data_ptr()
     row[LY.P_OUT_S] = t["out_s"].data_ptr()
@@ -137,17 +125,10 @@ def gdn_ptr_row(t, conv_state, ssm_state):
 
 
 def pack_qsa_layer(lw, moe, proj):
-    """proj: sglang's FP8 params {"qp": qkv_proj, "qp2": indexer.index_qk_proj, "out": o_proj} as (weight, scale)."""
+    """A QSA layer's views. proj: SGLang's FP8 params {"qp": qkv_proj, "qp2":
+    indexer.index_qk_proj, "out": o_proj} as (weight, scale)."""
     a = "self_attn."
     (qp, qp_s), (qp2, qp2_s), (out, out_s) = proj["qp"], proj["qp2"], proj["out"]
-    router = torch.cat(
-        [
-            lw["mlp.gate.weight"],
-            lw["mlp.shared_expert_gate.weight"],
-            torch.zeros(15, HIDDEN, dtype=torch.bfloat16, device=qp.device),
-        ],
-        dim=0,
-    )
     return {
         "hca": pack_hc(lw, "attn_hyper_connection"),
         "hcm": pack_hc(lw, "mlp_hyper_connection"),
@@ -161,17 +142,13 @@ def pack_qsa_layer(lw, moe, proj):
         "iqnorm": lw[a + "indexer.q_layernorm.weight"].contiguous(),
         "iknorm": lw[a + "indexer.k_layernorm.weight"].contiguous(),
         "out": out,
-        "router": pack_bf16(router.contiguous()),
-        "moe": _moe(moe),
+        "router": pack_router(lw),
+        "moe": moe,
     }
 
 
-def _moe(moe):
-    check_moe_params(moe)
-    return moe
-
-
 def _common_rows(row, t):
+    """The hyper-connection, router and MoE pointers every layer row carries."""
     row[LY.P_HCA_NORM] = t["hca"]["norm"].data_ptr()
     row[LY.P_HCA_DOWN] = t["hca"]["down"].data_ptr()
     row[LY.P_HCA_UP] = t["hca"]["up"].data_ptr()
@@ -188,7 +165,8 @@ def _common_rows(row, t):
 
 
 def qsa_ptr_row(t, k_buf, v_buf, ring, comp):
-    """Pointer table row for one QSA layer (this layer's KV / index-ring / compressed buffers)."""
+    """Pointer table row of a QSA layer (and its KV / index-ring / compressed
+    buffers)."""
     for b in (k_buf, v_buf):  # addressed with 64-bit pointers (any pool size)
         assert b.is_contiguous() and b.shape[-2:] == (2, 256)
     for b in (ring, comp):
@@ -269,18 +247,11 @@ def add_ple_ptrs(row, t, state):
 
 
 def pack_mtp(lw, moe, proj):
-    """MTP draft head: QSA layer 0 (FP8 projections, MXFP4 routed + shared experts), input fusion, final mixer."""
+    """MTP draft head: QSA layer 0 (FP8 projections, MXFP4 routed + shared experts),
+    input fusion, final mixer."""
     p = "layers.0."
     a = p + "self_attn."
     (qp, qp_s), (qp2, qp2_s), (out, out_s) = proj["qp"], proj["qp2"], proj["out"]
-    router = torch.cat(
-        [
-            lw[p + "mlp.gate.weight"],
-            lw[p + "mlp.shared_expert_gate.weight"],
-            torch.zeros(15, HIDDEN, dtype=torch.bfloat16, device=qp.device),
-        ],
-        dim=0,
-    )
     sub = {k[len(p) :]: v for k, v in lw.items() if k.startswith(p)}
     layer = {
         "hca": pack_hc(sub, "attn_hyper_connection"),
@@ -295,8 +266,8 @@ def pack_mtp(lw, moe, proj):
         "iknorm": lw[a + "indexer.k_layernorm.weight"].contiguous(),
         "out": out,
         "out_s": out_s,
-        "router": pack_bf16(router.contiguous()),
-        "moe": _moe(moe),
+        "router": pack_router(sub),
+        "moe": moe,
     }
     return {
         "layer": layer,
@@ -317,7 +288,8 @@ def pack_mtp(lw, moe, proj):
 
 
 def mtp_rows(m, k_buf, v_buf, ring, comp, grow):
-    """Pointer rows of a draft launch: [QSA layer row, global row (+ fusion pointers), final-mixer row]."""
+    """Pointer rows of a draft launch: [QSA layer row, global row (+ fusion
+    pointers), final-mixer row]."""
     row = qsa_ptr_row(m["layer"], k_buf, v_buf, ring, comp)
     grow[LY.G_MTP_PE] = m["pe"].data_ptr()
     grow[LY.G_MTP_PH] = m["ph"].data_ptr()
@@ -332,7 +304,8 @@ def mtp_rows(m, k_buf, v_buf, ring, comp, grow):
 
 
 def unshuffle16(w):
-    """aiter shuffle_weight(w, (16, 16)) inverse for 1-byte elements: [N, K] storage -> row-major [N, K] bytes."""
+    """aiter shuffle_weight(w, (16, 16)) inverse for 1-byte elements: [N, K] storage
+    -> row-major [N, K] bytes."""
     w = w.view(torch.uint8)
     rows, kb = w.shape
     return (
@@ -343,15 +316,13 @@ def unshuffle16(w):
 
 
 def unshuffle_moe_expert(m, e):
-    """Expert e of the AITER-layout MoE params back to the checkpoint layout, real rows / K only:
-    -> (gate [640, 1280], up [640, 1280], down [2560, 320], gate_s [640, 80], up_s [640, 80], down_s [2560, 20])."""
+    """Expert e of the AITER-layout MoE params back to the checkpoint layout, real
+    rows / K only: -> (gate [640, 1280], up [640, 1280], down [2560, 320],
+    gate_s [640, 80], up_s [640, 80], down_s [2560, 20])."""
     I, IP = LY.MOE_INTER, LY.MOE_INTER_PAD
 
-    w_un = unshuffle16
-
-    def s_un(
-        s,
-    ):  # e8m0_shuffle inverse: [a, d, f, c, e, b] -> [32 a + 16 b + c, 8 d + 4 e + f]
+    def s_un(s):
+        # e8m0_shuffle inverse: [a, d, f, c, e, b] -> [32 a + 16 b + c, 8 d + 4 e + f]
         rows, g = s.shape
         return (
             s.reshape(rows // 32, g // 8, 4, 16, 2, 2)
@@ -359,8 +330,8 @@ def unshuffle_moe_expert(m, e):
             .reshape(rows, g)
         )
 
-    gu, gus = w_un(m["gu"][e]), s_un(m["gu_s"][e])
-    dn, dns = w_un(m["dn"][e]), s_un(m["dn_s"][e])
+    gu, gus = unshuffle16(m["gu"][e]), s_un(m["gu_s"][e])
+    dn, dns = unshuffle16(m["dn"][e]), s_un(m["dn_s"][e])
     return (
         gu[:I],
         gu[IP : IP + I],

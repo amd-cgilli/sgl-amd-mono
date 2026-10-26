@@ -28,9 +28,8 @@ def spin(load_all, pending):
     """``load_all()`` again while ``pending(value)``; the value.
 
     The wait of a launch that runs on one GPU (TP 1, no peers): a pending wait
-    re-polls with a single ``s_nop`` between loads, as the measured kernel did,
-    and from ``CHECK_POLLS`` polls on checks its deadline every ``CHECK_POLLS``
-    polls. Past it, it sets the error word and stops the launch
+    re-polls with a single ``s_nop`` between loads and checks its deadline every
+    ``CHECK_POLLS`` polls. Past it, it sets the error word and stops the launch
     (``guard.Guard.fail``): with no peers there is no failure elsewhere to watch,
     and a failed wait on this GPU has already stopped it. The fault injection's
     stall runs ``common.sync._spin``."""

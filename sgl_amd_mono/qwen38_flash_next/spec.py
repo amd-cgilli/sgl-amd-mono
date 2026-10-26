@@ -36,14 +36,25 @@ import logging
 import os
 
 import torch
-from sglang.srt.monokernels.spec import (
-    DeviceLimits,
-    Feature,
-    MonoSpec,
-    Numerics,
-    NumericsKind,
-    Requirements,
-)
+
+try:
+    from sglang.kernels.plugin_kernels.amd.spec import (
+        DeviceLimits,
+        Feature,
+        MonoSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+    )
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.monokernels.spec import (
+        DeviceLimits,
+        Feature,
+        MonoSpec,
+        Numerics,
+        NumericsKind,
+        Requirements,
+    )
 
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.qwen38_flash_next import (
@@ -66,7 +77,7 @@ SSM_DTYPES = (torch.float32, torch.bfloat16)
 # The SGLang names this module reads, by file under the sglang package (``f(p)``: a
 # parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
 SGLANG_READS = {
-    "srt/monokernels/spec.py": (
+    "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
         "MONOKERNEL_API_VERSION",
         "DeviceLimits",
         "Feature",
@@ -74,7 +85,6 @@ SGLANG_READS = {
         "Numerics",
         "NumericsKind",
         "Requirements",
-        "rows",
         "batch_size",
         "tokens_per_request",
         "forward_mode",
@@ -82,7 +92,9 @@ SGLANG_READS = {
         "deadline_s",
         "copies",
     ),
-    "srt/monokernels/runtime.py": ('"target_verify"',),
+    "srt/kernel_plugins/amd/binding.py|srt/monokernels/runtime.py": (
+        '"target_verify"',
+    ),
     "srt/arg_groups/fields/*.py": (
         "speculative_algorithm",
         "speculative_eagle_topk",
@@ -175,7 +187,6 @@ SGLANG_READS = {
         "last_hc_hidden_states",
         "is_mrope_enabled",
         "ple",
-        "indexer",
         "is_qsa",
     ),
     "srt/layers/logits_processor.py": ("hidden_states",),
@@ -184,15 +195,15 @@ SGLANG_READS = {
 
 # The launches' logits and hidden states (the residual streams after the last
 # layer) against SGLang's forward of the same eager verify step (check mode), on
-# the step's worst row. The launches are bitwise salykova's in-tree kernel (534
-# steps, every launch's stream); the gap is SGLang's own noise: its AITER MXFP4 MoE
-# differs by about 2.6e-3 between two identical forwards, and 48 layers grow that
-# to a per-row logits rel of about 0.18 between two SGLang forwards of one step
-# (0.156 for the launches). The worst row of a step spreads wide, so the bounds
-# catch row, slot or request mix-ups, garbage layouts and NaN, not a subtly wrong
-# layer. Worst row per step, median / p1 or p99 of 364 steps (bs 1-8, triton),
-# worst of 11,824 steps (triton and aiter), and of SGLang against itself (an input
-# 1 bf16 ulp off moves SGLang's own hidden rel up to 3.1):
+# the step's worst row. The launches matched a reference implementation bitwise
+# over 534 steps (every launch's stream), so the gap is SGLang's own noise: its
+# AITER MXFP4 MoE differs by about 2.6e-3 between two identical forwards, and 48
+# layers grow that to a per-row logits rel of about 0.18 between two SGLang
+# forwards of one step (0.156 for the launches). The worst row of a step spreads
+# wide, so the bounds catch row, slot or request mix-ups, garbage layouts and NaN,
+# not a subtly wrong layer. Worst row per step, median / p1 or p99 of 364 steps
+# (bs 1-8, triton), worst of 11,824 steps (triton and aiter), and of SGLang
+# against itself (an input 1 bf16 ulp off moves SGLang's own hidden rel up to 3.1):
 NUMERICS = Numerics(
     NumericsKind.TOLERANCE,
     {
@@ -338,7 +349,7 @@ class _Built:
             or key.tokens_per_request != TOKENS
             or key.batch_size > MAX_R
         ):
-            # an eager step wider than the launches take: the normal forward
+            # an eager step the launches do not take: SGLang's forward
             return type(lm).forward(
                 lm, input_ids, positions, forward_batch, get_embedding, pp_proxy_tensors
             )
@@ -350,9 +361,9 @@ class _Built:
             ref = check.reference(
                 lm, input_ids, positions, forward_batch, self.runner.kinds
             )
-        # the RoPE positions SGLang's forward applies: its MRoPE positions [3, rows]
-        # where the model enables them (they differ from the sequence positions in
-        # a request with images or video)
+        # the RoPE positions SGLang's forward applies: MRoPE positions [3, rows]
+        # where enabled (they differ from the sequence positions with images or
+        # video)
         pos = forward_batch.mrope_positions if lm.is_mrope_enabled else positions
         x, hidden = self.runner.launch(forward_batch, pos)
         # the VL model's forward hands the streams on, as SGLang's does
@@ -398,7 +409,8 @@ def _build(model, hf_config, ctx) -> _Built:
         fault=guard.fault_injection(0),
     )
     runner.set_deadline(ctx.deadline_s)
-    if os.environ.get("SGLANG_AMD_MONO_CHECK", "0") == "1":
+    built = _Built(model, runner)
+    if built.check:
         from sgl_amd_mono.qwen38_flash_next import check
 
         check.weights(model, kinds)
@@ -411,7 +423,7 @@ def _build(model, hf_config, ctx) -> _Built:
         len(runner.plans),
         sorted(w // TOKENS for w in ctx.widths),
     )
-    return _Built(model, runner)
+    return built
 
 
 SPEC = MonoSpec(
@@ -429,7 +441,7 @@ SPEC = MonoSpec(
         attention_backends=frozenset({"triton", "aiter"}),
         server_args={
             # NEXTN (SGLang resolves it to EAGLE): verify steps of one draft chain
-            # of 3 steps, 4 rows a request; the kernel takes at most 4
+            # of 3 steps, 4 rows a request
             "speculative_algorithm": frozenset({"EAGLE"}),
             "speculative_eagle_topk": frozenset({1}),
             "speculative_num_steps": frozenset({3}),
@@ -468,6 +480,6 @@ SPEC = MonoSpec(
     numerics=NUMERICS,
     model_disable_reasons=_model_disable_reasons,
     build=_build,
-    api_version=1,  # sglang.srt.monokernels.spec.MONOKERNEL_API_VERSION
+    api_version=1,  # SGLang's MONOKERNEL_API_VERSION
     config_disable_reasons=_config_disable_reasons,
 )

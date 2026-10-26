@@ -1,7 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# Adapted from sgl-project/sglang#45353 at 6ce98069c3 (Apache-2.0), by salykova:
-# python/sglang/srt/models/qwen4_exp_monokernel.py (Qwen4ExpMTPMonoRunner) and the
-# hook of python/sglang/srt/models/qwen4_exp_mtp.py
 """Qwen3.8-Flash-Next's MTP draft on gfx950: its spec and forward (RFC #43949).
 
 The NEXTN draft runs its own steps: a draft extend of R requests x 4 rows
@@ -27,12 +24,12 @@ yet, and fault injection arms the target's launches only.
 
 A draft step is one launch (``gfx950/runner.DraftRunner``): the MTP input fusion
 (the token embedding and the target's hyper-connection hidden states, each
-normalized and projected), the QSA decoder layer and the draft's mixer. A draft
-extend runs R requests x 4 rows, a draft decode step R x 1, and ``_Draft.forward``
-returns what ``Qwen4ExpForCausalLMMTP.forward`` does. The weights are SGLang's,
-read in place, except the copies logged at startup: the hyper-connection mixers,
-router and input-fusion projections packed for the MFMA tiles, and the FP8
-projections SGLang keeps row-major, zero-padded in AITER's shuffle.
+normalized and projected), the QSA decoder layer and the draft's mixer;
+``_Draft.forward`` returns what ``Qwen4ExpForCausalLMMTP.forward`` does. The
+weights are SGLang's, read in place, except the copies logged at startup: the
+hyper-connection mixers, router and input-fusion projections packed for the MFMA
+tiles, and the FP8 projections SGLang keeps row-major, zero-padded in AITER's
+shuffle.
 """
 
 from __future__ import annotations
@@ -41,12 +38,20 @@ import functools
 import logging
 from typing import Optional
 
-from sglang.srt.monokernels.spec import (
-    DeviceLimits,
-    Feature,
-    MonoSpec,
-    Requirements,
-)
+try:
+    from sglang.kernels.plugin_kernels.amd.spec import (
+        DeviceLimits,
+        Feature,
+        MonoSpec,
+        Requirements,
+    )
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.monokernels.spec import (
+        DeviceLimits,
+        Feature,
+        MonoSpec,
+        Requirements,
+    )
 
 from sgl_amd_mono.common.plan import BLOCKS
 from sgl_amd_mono.qwen38_flash_next import spec as target
@@ -56,7 +61,12 @@ logger = logging.getLogger(__name__)
 # The SGLang names this module reads, by file under the sglang package (``f(p)``: a
 # parameter, ``"x"``: a string literal); test/unit/test_contract.py pins them.
 SGLANG_READS = {
-    "srt/monokernels/spec.py": ("DeviceLimits", "Feature", "MonoSpec", "Requirements"),
+    "kernels/plugin_kernels/amd/spec.py|srt/monokernels/spec.py": (
+        "DeviceLimits",
+        "Feature",
+        "MonoSpec",
+        "Requirements",
+    ),
     "srt/models/qwen4_exp_mtp.py": (
         "Qwen4ExpForCausalLMMTP",
         "model",
@@ -202,8 +212,7 @@ class _Draft:
     def forward(
         self, plan, input_ids, positions, forward_batch, input_embeds=None, *_, **kw
     ):
-        """A step the runtime routes: the launch, or SGLang's forward. API v1 routes
-        the draft by the target's verify key, which the draft never runs, so its
+        """A step the runtime routes: the launch, or SGLang's forward. The draft's
         own steps reach the launch through ``_route_draft_steps``."""
         if self.takes(forward_batch, input_embeds):
             return self.step(input_ids, forward_batch)
@@ -288,6 +297,6 @@ SPEC = MonoSpec(
     numerics=target.NUMERICS,
     model_disable_reasons=_model_disable_reasons,
     build=_build,
-    api_version=1,  # sglang.srt.monokernels.spec.MONOKERNEL_API_VERSION
+    api_version=1,  # SGLang's MONOKERNEL_API_VERSION
     tokens_per_request=_tokens_per_request,
 )

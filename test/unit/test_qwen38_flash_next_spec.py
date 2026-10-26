@@ -2,17 +2,27 @@
 entries (the target and the MTP draft), the configurations it refuses before
 load, the layer views it refuses after load (meta tensors of the real shapes),
 the verify widths it serves on the NEXTN recipe, the draft steps the draft's
-launch takes (routed by the wrapper the draft spec puts in front of its forward),
-its build keys and its fallback forward. SGLang checks the
-declared requirements, the same way for every spec."""
+wrapper routes to its launch, its build keys and its fallback forward. SGLang
+checks the declared requirements, the same way for every spec."""
 
+import inspect
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+import sglang
 import torch
-from sglang.srt.monokernels import spec as registry
-from sglang.srt.monokernels.guards import covered_capture_sizes
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+try:
+    from sglang.kernels.plugin_kernels.amd import spec as registry
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.monokernels import spec as registry
+try:
+    from sglang.srt.kernel_plugins.amd.binding import covered_capture_sizes
+except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.monokernels.guards import covered_capture_sizes
 
 import sgl_amd_mono
 from sgl_amd_mono.common.plan import key_tuple
@@ -27,11 +37,15 @@ from sgl_amd_mono.qwen38_flash_next import spec as q38
 from sgl_amd_mono.qwen38_flash_next.gfx950 import layout as LY
 from sgl_amd_mono.qwen38_flash_next.gfx950 import weights
 from sgl_amd_mono.qwen38_flash_next.gfx950.config import ConvStrides, MonoBuild
-from sgl_amd_mono.qwen38_flash_next.gfx950.runner import launch_plans
+from sgl_amd_mono.qwen38_flash_next.gfx950.runner import (
+    HC_DIM,
+    VerifyRunner,
+    _overlaps,
+    launch_plans,
+)
 
 TARGET, DRAFT = "Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLMMTP"
-# Qwen3.8-Flash-Next's text config (amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-
-# PLEFP8 config.json, text_config)
+# amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8 config.json, text_config
 TEXT = SimpleNamespace(
     **HF_CONFIG,
     **INDEXER_CONFIG,
@@ -94,12 +108,6 @@ def _qsa_steps(monkeypatch):
     monkeypatch.setattr(mtp, "_step_backend", lambda: "qsa")
 
 
-def _hc_dim():
-    from sgl_amd_mono.qwen38_flash_next.gfx950.runner import HC_DIM
-
-    return HC_DIM
-
-
 class _DraftRunner:
     """A DraftRunner whose launch records the steps it took."""
 
@@ -133,9 +141,7 @@ class _MtpLm(torch.nn.Module):
 
 
 def _step(mode, R, rows, dtype=torch.bfloat16, hc_rows=None):
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
-
-    hidden = torch.zeros(rows if hc_rows is None else hc_rows, _hc_dim(), dtype=dtype)
+    hidden = torch.zeros(rows if hc_rows is None else hc_rows, HC_DIM, dtype=dtype)
     return SimpleNamespace(
         forward_mode=ForwardMode[mode],
         batch_size=R,
@@ -167,8 +173,6 @@ def _wrapped():
 
 
 def test_the_draft_wrapper_keeps_the_forward_signature():
-    import inspect
-
     lm, _ = _wrapped()
     # SGLang's graph runners choose what to pass from the forward's parameters
     assert inspect.signature(lm.forward) == inspect.signature(_MtpLm().forward)
@@ -215,7 +219,10 @@ def test_the_runtimes_forward_wraps_the_draft_wrapper():
     # build installs the draft wrapper, then SGLang wraps it: API v1 routes the
     # draft by the target's verify key, which never matches a draft step, so every
     # draft step reaches the draft wrapper
-    from sglang.srt.monokernels import runtime
+    try:
+        from sglang.srt.kernel_plugins.amd import binding as runtime
+    except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+        from sglang.srt.monokernels import runtime
 
     lm, runner = _wrapped()
     served = frozenset(
@@ -223,9 +230,11 @@ def test_the_runtimes_forward_wraps_the_draft_wrapper():
         for r in range(1, 9)
     )
     built = mtp._Draft(lm, runner)
-    runtime._install_forward(
-        model=lm, built=built, served=served, spec=mtp.SPEC, backend="amd"
-    )
+    kw = dict(model=lm, built=built, served=served, spec=mtp.SPEC)
+    # SGLang before sgl-project/sglang#45389 also takes the backend name
+    if "backend" in inspect.signature(runtime._install_forward).parameters:
+        kw["backend"] = sgl_amd_mono.BACKEND
+    runtime._install_forward(**kw)
     for mode, R, rows in TAKEN:
         fb = _step(mode, R, rows)
         lm.forward(fb.input_ids, "p", fb)
@@ -269,10 +278,6 @@ def test_a_draft_shaped_step_the_launch_cannot_read_is_refused_in_capture(
 def test_every_draft_call_site_calls_the_model_forward_attribute():
     # the wrapper replaces the instance attribute model.forward: pin that SGLang's
     # draft paths call it, so a refactor fails here, not as a silent fallback
-    from pathlib import Path
-
-    import sglang
-
     root = Path(sglang.__file__).resolve().parent / "srt"
     calls = {
         "model_executor/runner/eager_runner.py": "model_runner.model.forward(",
@@ -289,8 +294,6 @@ def test_every_draft_call_site_calls_the_model_forward_attribute():
 
 
 def test_the_draft_writes_the_buffer_its_input_does_not_overlap():
-    from sgl_amd_mono.qwen38_flash_next.gfx950.runner import _overlaps
-
     a, b = torch.zeros(8, 4), torch.zeros(8, 4)
     assert _overlaps(a, a) and _overlaps(a, a[2:3]) and _overlaps(a[2:], a[:3])
     assert not _overlaps(a, b) and not _overlaps(a[:2], a[2:])
@@ -326,7 +329,6 @@ def test_the_draft_reads_new_hidden_states_from_a_fixed_address(monkeypatch):
 
 def test_build_installs_the_wrapper(monkeypatch, caplog):
     from sgl_amd_mono.qwen38_flash_next.gfx950 import runner as R
-    from sgl_amd_mono.qwen38_flash_next.gfx950 import weights as W
 
     class _Runner(_DraftRunner):
         def __init__(self, **kw):
@@ -337,8 +339,8 @@ def test_build_installs_the_wrapper(monkeypatch, caplog):
         def set_deadline(self, s):
             pass
 
-    monkeypatch.setattr(W, "param_ptrs", lambda model: {})
-    monkeypatch.setattr(W, "mtp_views", lambda model, copies, params: {})
+    monkeypatch.setattr(weights, "param_ptrs", lambda model: {})
+    monkeypatch.setattr(weights, "mtp_views", lambda model, copies, params: {})
     monkeypatch.setattr(R, "DraftRunner", _Runner)
     layer = SimpleNamespace(rotary_emb=None, attn=SimpleNamespace(layer_id=48))
     lm = _MtpLm()
@@ -462,8 +464,6 @@ def test_a_step_the_launches_do_not_take_runs_the_models_forward(key):
 def test_a_routed_verify_rotates_by_the_positions_sglang_applies(mrope):
     # with images or video, MRoPE's positions differ from the sequence positions;
     # the kernel takes each request's sequence start from seq_lens
-    from sgl_amd_mono.qwen38_flash_next.gfx950.runner import VerifyRunner
-
     lm = _Lm()
     lm.is_mrope_enabled = mrope
     lm.lm_head = None

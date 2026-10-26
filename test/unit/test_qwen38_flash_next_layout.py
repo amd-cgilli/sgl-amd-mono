@@ -3,10 +3,7 @@ weight layouts, on CPU: the kernel reads SGLang's MXFP4 FusedMoE params and FP8
 projection weights in place, so it hard-codes AITER's ``shuffle_weight(w, (16, 16))``
 and ``e8m0_shuffle`` storage orders and FusedMoE's padded intermediate width. The
 packing's un-shuffles must invert AITER's shuffles exactly, and its layout constants
-must match SGLang's AITER MoE weight sizes.
-
-Adapted from sgl-project/sglang#45353 at 6ce98069c3 (Apache-2.0), by salykova:
-test/registered/kernels/ops/speculative/test_qwen4_exp_monokernel_layout.py"""
+must match SGLang's AITER MoE weight sizes."""
 
 import pytest
 import torch

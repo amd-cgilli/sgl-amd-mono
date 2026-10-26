@@ -4,8 +4,7 @@ a request, 8 requests at the largest width: 32 rows).
 
 The cookbook's AMD recipe serves the BF16 / FP8 checkpoints at TP8; the launches
 run the whole model on one GPU, so these servers diverge from it in the TP size
-and the checkpoint (amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8). The flags
-are those the monokernel was measured with in SGLang (sgl-project/sglang#45353)."""
+and the checkpoint (amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8)."""
 
 import os
 

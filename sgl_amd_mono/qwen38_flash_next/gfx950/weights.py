@@ -1,7 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# Adapted from sgl-project/sglang#45353 at 6ce98069c3 (Apache-2.0), by salykova:
-# python/sglang/srt/models/qwen4_exp_monokernel.py (_moe_params, _proj_params) and
-# python/sglang/kernels/ops/speculative/qwen4_exp_monokernel/weights.py
 """The layer views the Qwen3.8-Flash-Next launches read, from SGLang's params.
 
 The MXFP4 experts (FusedMoE w13 / w2, AITER's (16, 16) shuffle, the shared expert
@@ -57,6 +54,8 @@ SGLANG_READS = {
         "block_inject_weight",
     ),
     "srt/models/qwen3_5.py": (
+        "layers",
+        "mlp",
         "linear_attn",
         "conv1d",
         "A_log",
@@ -89,12 +88,16 @@ SGLANG_READS = {
         "hyper_connection_mixer",
         "indexer",
         "ple",
+        "ple_embedding",
+        "ngram_embedding",
+        '"layer_multipliers"',
+        '"ngram_heads_vocab_sizes"',
+        '"ngram_heads_offsets"',
         "key_proj",
         "value_proj",
         "norm_key",
         "norm_query",
         "norm_conv",
-        "ple_embedding",
     ),
 }
 
@@ -150,21 +153,13 @@ def _small(kind: str, ple: bool) -> dict:
             (_BF16,),
         )
     else:
-        for ck, sg, n in (
-            ("self_attn.q_norm.weight", "q_norm.weight", 256),
-            ("self_attn.k_norm.weight", "k_norm.weight", 256),
-            (
-                "self_attn.indexer.q_layernorm.weight",
-                "indexer.q_layernorm.weight",
-                128,
-            ),  # fmt: skip
-            (
-                "self_attn.indexer.k_layernorm.weight",
-                "indexer.k_layernorm.weight",
-                128,
-            ),  # fmt: skip
+        for sg, n in (
+            ("q_norm.weight", 256),
+            ("k_norm.weight", 256),
+            ("indexer.q_layernorm.weight", 128),
+            ("indexer.k_layernorm.weight", 128),
         ):
-            t[ck] = (sg, (n,), (_BF16,))
+            t[f"self_attn.{sg}"] = (sg, (n,), (_BF16,))
     if ple:
         for name, shape in (
             ("key_proj.weight", (HC_DIM, HIDDEN)),
@@ -422,7 +417,7 @@ def ngram_views(ple_layer, copies: dict, params: set) -> dict:
         .to(dtype=torch.int64)
         .contiguous()
     )
-    copies[("ngram metadata", 1)] = meta
+    _log_copies(copies, "ngram metadata", (1,), meta, params)
     return {
         "meta": meta,
         "table": emb.ngram_embedding.weight,

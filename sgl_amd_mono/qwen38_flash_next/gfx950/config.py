@@ -1,6 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# Adapted from sgl-project/sglang#45353 at 6ce98069c3 (Apache-2.0), by salykova:
-# python/sglang/kernels/ops/speculative/qwen4_exp_monokernel/weights.py
 """Qwen3.8-Flash-Next monokernel geometry (``amd/Qwen3.8-Flash-Next-Quark-MXFP4-
 AttnFP8-PLEFP8``, SGLang's Qwen4-Exp) and the build key of one launch."""
 
@@ -21,16 +19,10 @@ GDN_KEY_DIM = GDN_HK * GDN_DK  # 2048
 GDN_VAL_DIM = GDN_HV * GDN_DV  # 6144
 GDN_CONV_DIM = 2 * GDN_KEY_DIM + GDN_VAL_DIM  # 10240
 GDN_QKVZ = 2 * GDN_KEY_DIM + 2 * GDN_VAL_DIM  # 16384
-GDN_CONV_K = 4
 # MoE: 512 routed MXFP4 experts, top-10, and the shared expert fused at index 512
 N_EXPERTS = 512
 TOPK = 10
 MOE_INTER = 640
-# full attention (QSA)
-ATT_HQ = 24
-ATT_HKV = 2
-ATT_D = 256
-ROTARY_DIM = 64
 
 # a launch's rows: R requests x L verify tokens (row t: request t // L, step t % L)
 MAX_R = 8
@@ -50,38 +42,31 @@ class ConvStrides(msgspec.Struct, frozen=True):
 
 class MonoBuild(msgspec.Struct, frozen=True):
     """One launch: its layers and rows, and the cache strides it is compiled for;
-    every field is a scalar of the JIT cache key (``plan.key_tuple``).
+    every field is a scalar of the JIT cache key (``plan.key_tuple``)."""
 
-    ``plan``: the launch's layer kinds, comma-separated (``gdn`` | ``qsa``);
-    ``nreq`` R requests of ``ntok`` L verify tokens; ``rtt_stride``: req_to_token
-    row stride (int32 elements); ``pos_stride``: element stride between the 3
-    MRoPE position axes (0: 1-D text positions); ``map_i64``: the request -> mamba
-    slot map is int64; ``ple_first``: the launch starts with layer 1's PLE;
-    ``final_mix``: it ends with the model-level mixer; ``prelude``: it embeds the
-    tokens (launch 0); ``iconv``, ``issm_row`` (elements per request row of
-    intermediate_ssm), ``ple_ist_row`` (bf16 elements per request row of the PLE
-    intermediate short-conv state) and ``ictx_row`` (int64 elements per request
-    row of the n-gram intermediate context): SGLang's verify scratch strides;
-    ``first_src``: where layer 0's input comes from (``global``: the previous
-    launch, ``mtp``: the MTP input fusion); ``ssm_bf16``: the GDN SSM states are
-    bf16 (SGLANG_MAMBA_SSM_DTYPE=bfloat16; the recurrence stays f32, the states
-    are rounded when stored, as SGLang does)."""
-
-    plan: str
-    nreq: int
-    ntok: int
-    rtt_stride: int = 0
+    plan: str  # the launch's layer kinds, comma-separated (gdn | qsa)
+    nreq: int  # R requests
+    ntok: int  # of L verify tokens each
+    rtt_stride: int = 0  # req_to_token row stride (int32 elements)
+    # element stride between the 3 MRoPE position axes (0: 1-D text positions)
     pos_stride: int = 1
-    map_i64: bool = False
-    ple_first: bool = False
-    final_mix: bool = False
-    prelude: bool = False
+    map_i64: bool = False  # the request -> mamba slot map is int64
+    ple_first: bool = False  # the launch starts with layer 1's PLE
+    final_mix: bool = False  # it ends with the model-level mixer
+    prelude: bool = False  # it embeds the tokens (launch 0)
     eos_token_id: int = 0
+    # SGLang's verify scratch strides: the intermediate conv window, and elements
+    # per request row of intermediate_ssm, of the PLE intermediate short-conv state
+    # (bf16) and of the n-gram intermediate context (int64)
     iconv: ConvStrides = msgspec.field(default_factory=ConvStrides)
     issm_row: int = 4 * GDN_HV * GDN_DK * GDN_DV
     ple_ist_row: int = 4 * HC_DIM * 9
     ictx_row: int = 8
+    # layer 0's input: "global" the previous launch, "embed" the prelude's token
+    # embedding, "mtp" the MTP input fusion
     first_src: str = "global"
+    # the GDN SSM states are bf16 (SGLANG_MAMBA_SSM_DTYPE=bfloat16): the recurrence
+    # stays f32 and the states are rounded when stored, as SGLang does
     ssm_bf16: bool = False
     # each request's first sequence position is its seq_lens entry (a target verify,
     # whose RoPE positions may be MRoPE's), not its first row's position

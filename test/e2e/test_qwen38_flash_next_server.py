@@ -102,14 +102,14 @@ class TestMonokernelVerify(CustomTestCase):
     def test_a_the_tested_batches_run_the_monokernels(self):
         # routing is fixed at startup; without this, the other tests could pass on
         # the normal path alone
+        logs = _logs(self.logs)
         self.assertIn(
             "monokernel qwen38_flash_next_hip on gfx950 runs target_verify steps of "
             f"batch size {list(range(1, 9))} x 4 tokens",
-            _logs(self.logs),
+            logs,
         )
         # the MTP draft's own steps: SGLang's capture check never sees them, so the
         # spec logs each draft key at its first launch (graph warmup included)
-        logs = _logs(self.logs)
         self.assertIn("monokernel qwen38_flash_next MTP draft: draft extend", logs)
         for key in (("DRAFT_EXTEND_V2", 1, 4), ("DECODE", 1, 1)):
             self.assertIn(f"monokernel qwen38_flash_next MTP draft runs {key}", logs)

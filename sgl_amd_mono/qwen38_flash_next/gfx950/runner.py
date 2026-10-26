@@ -1,7 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-# Adapted from sgl-project/sglang#45353 at 6ce98069c3 (Apache-2.0), by salykova:
-# python/sglang/srt/models/qwen4_exp_monokernel.py (Qwen4ExpMonoRunner,
-# Qwen4ExpMTPMonoRunner)
 """The Qwen3.8-Flash-Next launches on gfx950: the buffers, the per-step pointer
 tables and the launch sequence of a verify (and of an MTP draft step).
 
@@ -158,8 +155,8 @@ class _Base:
         self.epoch[guard.GUARD_DEADLINE + 1] = ticks >> 32
 
     def kernel(self, key: MonoBuild):
-        """The launcher of ``key``, built once (FlyDSL compiles it at its first call,
-        or ``precompile``, and keeps it in its disk cache)."""
+        """The launcher of ``key``, built once (FlyDSL compiles it at its first call
+        and keeps it in its disk cache)."""
         launch = self._kernels.get(key)
         if launch is None:
             no_capture(f"building {key}")
@@ -167,9 +164,6 @@ class _Base:
 
             launch = self._kernels[key] = build_qwen38_flash_next_kernel(key)
         return launch
-
-    def precompile(self, key: MonoBuild) -> None:
-        compile_only(self.kernel(key))
 
     def _cached(self, key):
         """The tables built for ``key``, kept for good once a graph captures them."""
@@ -589,10 +583,8 @@ class DraftRunner(_Base):
         # the launch reads a copy at a fixed address, so the tables a warmup built
         # are the ones its graph capture finds
         self.ids_buf = torch.zeros(S, dtype=torch.int64, device=device)
-        # hidden states that are not a previous step's output are read from a copy
-        # at a fixed address: with rejection sampling a chain step's hidden states
-        # are a new tensor each step (select_top_k_tokens indexes them), and a
-        # graph capture allocates it at another address than its warmup
+        # the same for hidden states that are not a previous step's output: with
+        # rejection sampling select_top_k_tokens makes a new tensor each step
         self.hin_buf = torch.zeros(S, HC_DIM, **bf16)
         self.ssq_buf = torch.zeros(S, 4, LY.NPART, dtype=torch.float32, device=device)
         # a QSA-only launch reads no mamba slot
