@@ -202,14 +202,14 @@ class _Base:
         )
 
 
-def _step_reasons(fb, R: int, L: int) -> list[str]:
+def _step_reasons(fb, pos, R: int, L: int) -> list[str]:
     reasons = []
-    for name in ("input_ids", "out_cache_loc", "positions", "req_pool_indices"):
+    for name in ("input_ids", "out_cache_loc", "req_pool_indices", "seq_lens"):
         t = getattr(fb, name)
         if t.dtype != torch.int64:
             reasons.append(f"forward_batch.{name} is {t.dtype}, the kernel reads int64")
-    if fb.positions.dim() not in (1, 2):
-        reasons.append(f"positions of shape {tuple(fb.positions.shape)}")
+    if pos.dtype != torch.int64 or pos.dim() not in (1, 2) or pos.stride(-1) != 1:
+        reasons.append(f"positions {pos.dtype} of shape {tuple(pos.shape)}")
     if fb.req_pool_indices.numel() != R:
         reasons.append(f"{fb.req_pool_indices.numel()} request slots for {R} requests")
     if fb.input_ids.numel() != R * L:
@@ -298,14 +298,15 @@ class VerifyRunner(_Base):
                 final_mix=i == last,
                 prelude=i == 0,
                 first_src="embed" if i == 0 else "global",
+                seq_p0=True,
                 **meta,
             )
             for i, (plan, _) in enumerate(self.plans)
         ]
 
-    def prepare_step(self, fb):
+    def prepare_step(self, fb, pos):
         """The step's pointer tables and launch keys (built at the batch size's first,
-        eager forward, and kept)."""
+        eager forward, and kept); ``pos``: the RoPE positions."""
         from sglang.srt.model_executor.forward_context import (
             get_req_to_token_pool,
             get_token_to_kv_pool,
@@ -317,7 +318,7 @@ class VerifyRunner(_Base):
         key = (
             R,
             fb.input_ids.data_ptr(),
-            fb.positions.data_ptr(),
+            pos.data_ptr(),
             fb.out_cache_loc.data_ptr(),
             fb.req_pool_indices.data_ptr(),
             fb.seq_lens.data_ptr(),
@@ -329,10 +330,10 @@ class VerifyRunner(_Base):
             return got
         no_capture("building the pointer tables")
         self._hold(cos)
-        reasons = _step_reasons(fb, R, self.L) + self.cache_reasons(rtp, kvp, R)
+        reasons = _step_reasons(fb, pos, R, self.L) + self.cache_reasons(rtp, kvp, R)
         if reasons:
             raise ValueError("Qwen3.8-Flash-Next monokernel: " + "; ".join(reasons))
-        tables, meta = self._tables_for(fb, rtp, kvp, cos, R)
+        tables, meta = self._tables_for(fb, pos, rtp, kvp, cos, R)
         return self._keep(key, (tables, self.keys(R, meta)))
 
     def cache_reasons(self, rtp, kvp, R: int) -> list[str]:
@@ -435,7 +436,7 @@ class VerifyRunner(_Base):
             reasons.append(f"the GDN layers' SSM states differ in dtype: {ssm_dtypes}")
         return reasons
 
-    def _tables_for(self, fb, rtp, kvp, cos, R: int):
+    def _tables_for(self, fb, pos, rtp, kvp, cos, R: int):
         """One int64 table a launch: a row a layer, the global row, and the final
         mixer's row in the last launch."""
         mamba_map = rtp.req_index_to_mamba_index_mapping
@@ -444,7 +445,7 @@ class VerifyRunner(_Base):
 
         def global_row(launch: int) -> list:
             g = packing.global_ptr_row(
-                fb.positions,
+                pos,
                 fb.out_cache_loc,
                 fb.req_pool_indices,
                 fb.seq_lens,
@@ -511,7 +512,6 @@ class VerifyRunner(_Base):
             if li == len(self.plans) - 1:
                 rows.append(frow)
             tables.append(self._upload(rows))
-        pos = fb.positions
         meta = dict(
             rtt_stride=rtp.req_to_token.stride(0),
             # 1-D text positions: all three MRoPE axes read the same element
@@ -525,13 +525,14 @@ class VerifyRunner(_Base):
         )
         return tables, meta
 
-    def launch(self, fb) -> tuple[torch.Tensor, torch.Tensor]:
-        """A verify step -> (the final mixer's output x [S, HIDDEN], the residual
-        streams after the last layer [S, HC_DIM])."""
+    def launch(self, fb, pos) -> tuple[torch.Tensor, torch.Tensor]:
+        """A verify step with RoPE positions ``pos`` (SGLang's MRoPE positions where
+        the model enables them) -> (the final mixer's output x [S, HIDDEN], the
+        residual streams after the last layer [S, HC_DIM])."""
         S = int(fb.batch_size) * self.L
         if S > MAX_T:
             raise ValueError(f"Qwen3.8-Flash-Next monokernel: {S} rows past {MAX_T}")
-        tables, keys = self.prepare_step(fb)
+        tables, keys = self.prepare_step(fb, pos)
         stream = torch.cuda.current_stream()
         h = self.h_bufs[1]  # unused by the prelude launch, which embeds the tokens
         for i, key in enumerate(keys):
@@ -621,7 +622,8 @@ class DraftRunner(_Base):
             return got
         no_capture("building the pointer tables")
         self._hold(cos)
-        reasons = _step_reasons(fb, R, S // R) + qsa_cache_reasons(kvp, self.layer_id)
+        reasons = _step_reasons(fb, fb.positions, R, S // R)
+        reasons += qsa_cache_reasons(kvp, self.layer_id)
         if reasons:
             raise ValueError("Qwen3.8-Flash-Next monokernel: " + "; ".join(reasons))
         g = packing.global_ptr_row(

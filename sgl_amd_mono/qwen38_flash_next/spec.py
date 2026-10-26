@@ -173,11 +173,13 @@ SGLANG_READS = {
         "Qwen4ExpForConditionalGeneration",
         "hyper_connection_mixer",
         "last_hc_hidden_states",
+        "is_mrope_enabled",
         "ple",
         "indexer",
         "is_qsa",
     ),
     "srt/layers/logits_processor.py": ("hidden_states",),
+    "srt/model_executor/forward_batch_info.py": ("mrope_positions",),
 }
 
 # The launches' logits and hidden states (the residual streams after the last
@@ -348,7 +350,11 @@ class _Built:
             ref = check.reference(
                 lm, input_ids, positions, forward_batch, self.runner.kinds
             )
-        x, hidden = self.runner.launch(forward_batch)
+        # the RoPE positions SGLang's forward applies: its MRoPE positions [3, rows]
+        # where the model enables them (they differ from the sequence positions in
+        # a request with images or video)
+        pos = forward_batch.mrope_positions if lm.is_mrope_enabled else positions
+        x, hidden = self.runner.launch(forward_batch, pos)
         # the VL model's forward hands the streams on, as SGLang's does
         lm.model.last_hc_hidden_states = hidden
         if get_embedding:

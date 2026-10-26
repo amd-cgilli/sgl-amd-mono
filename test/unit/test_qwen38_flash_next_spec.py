@@ -458,6 +458,28 @@ def test_a_step_the_launches_do_not_take_runs_the_models_forward(key):
     assert lm.ran == [("ids", "positions", "batch", False, None)]
 
 
+@pytest.mark.parametrize("mrope", [True, False], ids=["mrope", "text positions"])
+def test_a_routed_verify_rotates_by_the_positions_sglang_applies(mrope):
+    # with images or video, MRoPE's positions differ from the sequence positions;
+    # the kernel takes each request's sequence start from seq_lens
+    from sgl_amd_mono.qwen38_flash_next.gfx950.runner import VerifyRunner
+
+    lm = _Lm()
+    lm.is_mrope_enabled = mrope
+    lm.lm_head = None
+    lm.logits_processor = lambda ids, x, head, fb, aux: SimpleNamespace()
+    launched = []
+    runner = SimpleNamespace(launch=lambda fb, pos: launched.append(pos) or ("x", "h"))
+    fb = SimpleNamespace(mrope_positions="mrope positions")
+    key = registry.ShapeKey("target_verify", batch_size=2, tokens_per_request=4)
+    q38._Built(lm, runner).forward(registry.Plan(key=key), "ids", "positions", fb)
+    assert launched == ["mrope positions" if mrope else "positions"]
+    verify = VerifyRunner.__new__(VerifyRunner)
+    verify.plans, verify.L = launch_plans(["gdn"] * 3 + ["qsa"]), 4
+    verify.eos_token_id, verify.fault_site, verify.fault_after = 1, 0, 0
+    assert all(k.seq_p0 for k in verify.keys(2, {}))
+
+
 # ---------------------------------------------------------------- build keys
 def test_a_build_key_reaches_the_jit_cache_key():
     key = MonoBuild(plan="gdn,gdn,gdn,qsa", nreq=8, ntok=4, rtt_stride=262208)

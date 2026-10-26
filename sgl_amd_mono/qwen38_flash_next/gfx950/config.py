@@ -83,6 +83,9 @@ class MonoBuild(msgspec.Struct, frozen=True):
     ictx_row: int = 8
     first_src: str = "global"
     ssm_bf16: bool = False
+    # each request's first sequence position is its seq_lens entry (a target verify,
+    # whose RoPE positions may be MRoPE's), not its first row's position
+    seq_p0: bool = False
     # SGLANG_AMD_MONO_FAULT_INJECT: the wait this launch stalls at (0: none), once
     # fault_after steps have run
     fault_site: int = 0

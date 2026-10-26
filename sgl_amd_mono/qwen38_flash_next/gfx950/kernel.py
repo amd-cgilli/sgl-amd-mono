@@ -196,6 +196,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
     keyed = key_tuple(key, SOURCES)
     plan, nreq, ntok = key.layers, key.nreq, key.ntok
     rtt_stride, pos_stride, map_i64 = key.rtt_stride, key.pos_stride, key.map_i64
+    seq_p0 = key.seq_p0
     ple_first, final_mix, prelude = key.ple_first, key.final_mix, key.prelude
     eos_token_id, first_src, ssm_bf16 = key.eos_token_id, key.first_src, key.ssm_bf16
     issm_row, ple_ist_row, ictx_row = key.issm_row, key.ple_ist_row, key.ictx_row
@@ -4634,14 +4635,16 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                         )
                     ),
                 )
-                # logical position = text position
-                lds_st(
-                    xi,
-                    RQ_P0 + tid,
-                    fx.Int32(
-                        bo.buffer_load(r_pos, tid * L * 2, vec_width=1, dtype=T.i32)
-                    ),
-                )
+                # the request's first row's sequence position: with seq_p0 its prefix
+                # length (the rows' positions are then RoPE coordinates only, MRoPE's
+                # in a request with images or video)
+                if const_expr(seq_p0):
+                    p0 = bo.buffer_load(
+                        _rsrc(ptr(GI, LY.G_SEQ)), tid * 2, vec_width=1, dtype=T.i32
+                    )
+                else:
+                    p0 = bo.buffer_load(r_pos, tid * L * 2, vec_width=1, dtype=T.i32)
+                lds_st(xi, RQ_P0 + tid, fx.Int32(p0))
             gpu.barrier()
             if tid == 0:
                 acc_ = fx.Int32(0)
