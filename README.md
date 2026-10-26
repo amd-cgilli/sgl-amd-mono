@@ -19,7 +19,7 @@ The library implements SGLang's monokernel interface ([RFC #43949](https://githu
 | GLM-5.3 | MI355X (gfx950) | 4, 8 | All 75 MoE layers (one launch each), in decode and MTP verify steps of up to 8 rows (4 at TP4) |
 | MiniMax-M3 (MXFP4) | MI350X, MI355X (gfx950) | 4 | The 57 sparse MoE layers in decode and EAGLE3 verify steps of up to 16 rows |
 | MiniMax-M3.1-Flash (NVFP4 experts) | MI350X (gfx950) | 4 | o_proj and the FFN of the 57 sparse layers, after SGLang's attention, in decode and DSpark verify steps of up to 16 rows |
-| Qwen3.8-Flash-Next (MXFP4) | MI355X (gfx950) | 1 | The whole model (48 layers in 13 launches) in NEXTN verify steps of up to 8 requests x 4 tokens; the MTP draft's draft extend (up to 8 x 4 rows) and draft decode steps (up to 8 x 1) are routed to its launch, pending a GPU run with CUDA graphs |
+| Qwen3.8-Flash-Next (MXFP4) | MI355X (gfx950) | 1 | The whole model (48 layers in 13 launches) in NEXTN verify steps of up to 8 requests x 4 tokens; the MTP draft's draft extend (up to 8 x 4 rows) and draft decode steps (up to 8 x 1) are routed to its launch |
 
 ### Design
 
@@ -108,10 +108,11 @@ SGLANG_USE_AITER=1 python -m sglang.launch_server \
   --monokernel-backend amd
 ```
 
-Qwen3.8-Flash-Next, with its MTP head (one MI355X; the flags of `test/e2e/qwen38_flash_next_server.py`):
+Qwen3.8-Flash-Next, with its MTP head (one MI355X; the server flags of `test/e2e/qwen38_flash_next_server.py`, which also caps running requests at 16 to step past 8):
 
 ```bash
-SGLANG_USE_AITER=1 SGLANG_USE_AITER_UNIFIED_ATTN=1 SGLANG_MAMBA_SSM_DTYPE=bfloat16 \
+SGLANG_USE_AITER=1 SGLANG_USE_AITER_UNIFIED_ATTN=1 AITER_FLYDSL_FORCE=1 \
+SGLANG_MAMBA_SSM_DTYPE=bfloat16 SGLANG_USE_AITER_FP8_PER_TOKEN=1 \
 python -m sglang.launch_server \
   --model-path amd/Qwen3.8-Flash-Next-Quark-MXFP4-AttnFP8-PLEFP8 \
   --tp 1 \
@@ -160,6 +161,7 @@ sgl-amd-mono/
 │   │   └── runner.py    # launch runner
 │   ├── qwen38_a95b_mxfp4/   # Qwen3.8-2.4T-A95B-Quark-MXFP4; spec and kernels land in its PR
 │   └── qwen38_flash_next/
+│       ├── README.md    # how the kernel works, stage by stage
 │       ├── spec.py      # target model: spec and forward
 │       ├── draft.py     # MTP draft: spec and forward
 │       ├── check.py     # SGLANG_AMD_MONO_CHECK: weights and each step against SGLang's own
