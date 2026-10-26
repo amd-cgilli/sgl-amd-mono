@@ -1,0 +1,3 @@
+#!/bin/sh
+echo "  Name:                    gfx950"
+echo "  Compute Unit:            256"

@@ -1,0 +1,7 @@
+prelude_r1 | src: vgpr 182 sgpr 86 lds 161792 scratch 0 instrs 12554 | port: vgpr 184 sgpr 96 lds 161792 scratch 0 instrs 13397
+fault_r1 | src: vgpr 182 sgpr 86 lds 161792 scratch 0 instrs 12556 | port: vgpr 256 sgpr 103 lds 161792 scratch 40 instrs 16237
+mtp_r8 | src: vgpr 256 sgpr 104 lds 161792 scratch 8 instrs 27654 | port: vgpr 256 sgpr 104 lds 161792 scratch 16 instrs 30563
+ple_r1 | src: vgpr 224 sgpr 106 lds 161792 scratch 0 instrs 54292 | port: vgpr 234 sgpr 104 lds 161792 scratch 0 instrs 58563
+mid_r2 | src: vgpr 256 sgpr 104 lds 161792 scratch 0 instrs 71395 | port: vgpr 256 sgpr 106 lds 161792 scratch 8 instrs 75994
+bf16_r4 | src: vgpr 228 sgpr 104 lds 161792 scratch 0 instrs 98611 | port: vgpr 234 sgpr 104 lds 161792 scratch 0 instrs 104145
+final_r8 | src: vgpr 256 sgpr 106 lds 161792 scratch 24 instrs 164262 | port: vgpr 256 sgpr 106 lds 161792 scratch 24 instrs 177586
