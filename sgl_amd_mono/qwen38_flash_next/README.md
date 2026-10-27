@@ -240,12 +240,13 @@ a warmup builds are the ones its graph capture finds.
   13-launch plan, the scratch regions, the weight views, the RoPE positions a routed verify passes and the draft
   routing wrapper. `test/unit/test_qwen38_flash_next_layout.py` checks that the packing's un-shuffles invert AITER's
   shuffles and that the layout constants match SGLang's AITER MoE weight sizes.
-- **Kernel test** (`test/kernels/test_qwen38_flash_next_launches.py`, one gfx950 GPU, the checkpoint's first 12 layers
-  and its MTP head): every launch kind (prelude, PLE, middle, final mixer, MTP draft extend and decode) at 1 and 8
-  requests and 7 padded to 8, verify steps on MRoPE positions. Each step leaves the error words zero, writes only its
-  own pool rows, and replays from a CUDA graph bitwise; the prelude's n-gram embedding and context are bitwise a torch
-  reference's; every MoE block matches an f32 router and an a16w4 torch MoE. The GDN and QSA layers are covered by
-  check mode.
+- **Kernel test** (`test/kernels/test_qwen38_flash_next_launches.py`, one gfx950 GPU, no checkpoint: 12 layers and an
+  MTP head of random weights in SGLang's post-load layouts): every launch kind (prelude, PLE, middle, final mixer, MTP
+  draft extend and decode) at 1 and 8 requests and 7 padded to 8, verify steps on MRoPE positions. Each step leaves
+  the error words zero, writes only its own pool rows, also from a CUDA graph, which replays an unpadded step bitwise
+  and a padded one's layer 0-3 states but KV slot 0 (see Limitations); the prelude's n-gram embedding and context are
+  bitwise a torch reference's; every MoE block matches an f32 router and an a16w4 torch MoE.
+  The GDN and QSA layers are covered by check mode.
 - **Check mode** (`SGLANG_AMD_MONO_CHECK=1`): at build, the weights the launches read of layers 0, 1 and 3 (and
   experts 0, 255, 511 and the shared expert) are compared exactly against the checkpoint's safetensors. Then
   every eager routed verify step first runs SGLang's forward on the same inputs (restoring the committed GDN and PLE
@@ -270,3 +271,5 @@ of a step grows with it. Batches above 8 requests run SGLang's forward.
 - TP = 1
 - bf16 KV cache; `triton` or `aiter` attention backend
 - contexts up to 294,848 tokens
+- a padded graph batch's real rows are not run-to-run deterministic: the pad rows race on KV slot 0, and each row's
+  MoE sums its experts in an order that depends on the whole batch's routes

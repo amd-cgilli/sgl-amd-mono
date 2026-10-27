@@ -181,7 +181,7 @@ pytest test/kernels test/e2e -k glm53_flash                     # GLM_53_FLASH_M
 pytest test/e2e -k "glm53 and not glm53_flash"                  # GLM_53_MODEL_PATH set: server at TP8
 pytest test/kernels test/e2e -k "minimax_m3 and not minimax_m31"  # 4 x MI350X or MI355X, MINIMAX_M3_MODEL_PATH and MINIMAX_M3_EAGLE3_PATH set
 pytest test/kernels test/e2e -k minimax_m31                     # 4 x MI350X, MINIMAX_M31_FLASH_MODEL_PATH set
-pytest test/kernels test/e2e -k qwen38_flash_next               # 1 x MI355X, QWEN38_FLASH_NEXT_MODEL_PATH set (the kernel test reads its first 12 layers)
+pytest test/kernels test/e2e -k qwen38_flash_next               # 1 x MI355X, QWEN38_FLASH_NEXT_MODEL_PATH set (the kernel test needs no checkpoint)
 ```
 
 Kernel-only time of the GLM-5.3-Flash launches (no model needed): `torchrun --nproc-per-node 4 test/kernels/glm53_flash/time_layers.py --kind model --rows 2,4,8` (`--kind full` for the whole served step: layer 0 from the tokens, the dense layers, layers 3 to 44 and the tail).
