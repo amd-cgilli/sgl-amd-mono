@@ -2,8 +2,9 @@
 entries (the target and the MTP draft), the configurations it refuses before
 load, the layer views it refuses after load (meta tensors of the real shapes),
 the verify widths it serves on the NEXTN recipe, the draft steps the draft's
-wrapper routes to its launch, its build keys and its fallback forward. SGLang
-checks the declared requirements, the same way for every spec."""
+wrapper routes to its launch (and the guards that keep every draft step of up to 8
+requests on it), its build keys and its fallback forward. SGLang checks the
+declared requirements, the same way for every spec."""
 
 import inspect
 from pathlib import Path
@@ -102,10 +103,15 @@ def test_the_draft_spec_declares_the_drafts_own_backend():
 
 
 # ---------------------------------------------------------------- draft steps
+SHARES_MTP_SPARSE_INDICES = mtp._shares_mtp_sparse_indices
+
+
 @pytest.fixture(autouse=True)
 def _qsa_steps(monkeypatch):
-    """Draft steps run on the draft's QSA backend, as on a server."""
+    """Draft steps run on the draft's QSA backend with index sharing off, as on a
+    server."""
     monkeypatch.setattr(mtp, "_step_backend", lambda: "qsa")
+    monkeypatch.setattr(mtp, "_shares_mtp_sparse_indices", lambda: False)
 
 
 class _DraftRunner:
@@ -158,11 +164,26 @@ TAKEN = [
 ]
 NOT_TAKEN = {
     "nine requests": _step("DECODE", 9, 9),
+    "nine requests extend": _step("DRAFT_EXTEND_V2", 9, 36),
     "verify": _step("TARGET_VERIFY", 2, 8),
     "extend": _step("EXTEND", 2, 8),
+}
+# draft steps of up to 8 requests the launch cannot read: refused, never SGLang's
+REFUSED = {
     "three rows a request": _step("DRAFT_EXTEND_V2", 2, 6),
     "fp32 hidden": _step("DECODE", 2, 2, dtype=torch.float32),
     "hidden of other rows": _step("DECODE", 2, 2, hc_rows=4),
+    "strided hidden": SimpleNamespace(
+        **{
+            **vars(_step("DECODE", 2, 2)),
+            "spec_info": SimpleNamespace(
+                hidden_states=torch.zeros(HC_DIM, 2, dtype=torch.bfloat16).t()
+            ),
+        }
+    ),
+    "no hidden states": SimpleNamespace(
+        **{**vars(_step("DRAFT_EXTEND_V2", 8, 32)), "spec_info": None}
+    ),
 }
 
 
@@ -205,14 +226,19 @@ def test_the_draft_wrapper_runs_the_forward_it_wraps(fb, as_kwarg):
     assert lm.ran == [fb.forward_mode.name] and runner.launched == []
 
 
-def test_input_embeds_run_the_forward_the_wrapper_wraps():
+def test_a_draft_step_with_input_embeds_is_refused():
     lm, runner = _wrapped()
     fb = _step("DECODE", 2, 2)
-    assert lm.forward(fb.input_ids, "p", fb, torch.zeros(2)) == "the model's forward"
-    assert lm.forward(fb.input_ids, "p", fb, input_embeds=torch.zeros(2)) == (
+    with pytest.raises(ValueError, match="has input embeddings"):
+        lm.forward(fb.input_ids, "p", fb, torch.zeros(2))
+    with pytest.raises(ValueError, match="has input embeddings"):
+        lm.forward(fb.input_ids, "p", fb, input_embeds=torch.zeros(2))
+    # above 8 requests the wrapped forward handles them
+    fb = NOT_TAKEN["nine requests"]
+    assert lm.forward(fb.input_ids, "p", fb, input_embeds=torch.zeros(9)) == (
         "the model's forward"
     )
-    assert runner.launched == []
+    assert runner.launched == [] and lm.ran == ["DECODE"]
 
 
 def test_the_runtimes_forward_wraps_the_draft_wrapper():
@@ -255,24 +281,48 @@ def test_the_wrapper_checks_the_backend_once_a_step_mode(monkeypatch):
     assert runner.launched == [("DECODE", 1), ("DECODE", 2)]
 
 
-@pytest.mark.parametrize("name", ["fp32 hidden", "hidden of other rows"])
-def test_a_draft_shaped_step_the_launch_cannot_read_is_refused_in_capture(
-    monkeypatch, caplog, name
-):
+@pytest.mark.parametrize("fb", REFUSED.values(), ids=REFUSED.keys())
+def test_a_draft_step_the_launch_cannot_read_is_refused(fb):
+    # eager as in capture: SGLang's draft forward would run a draft step the
+    # launch serves, and with a launched extend before it, read a stale selection
     lm, runner = _wrapped()
-    fb = NOT_TAKEN[name]
-    with caplog.at_level("WARNING"):
-        assert lm.forward(fb.input_ids, "p", fb) == "the model's forward"
-    assert "runs the standard path" in caplog.text
-    # a captured graph would run the standard path for good: refused
-    monkeypatch.setattr(mtp, "_is_capturing", lambda: True)
-    with pytest.raises(ValueError, match="refusing to capture"):
+    with pytest.raises(ValueError, match="refusing to run SGLang's draft forward"):
         lm.forward(fb.input_ids, "p", fb)
-    # steps no draft launch takes are not draft-shaped: no refusal
-    for other in ("nine requests", "verify", "extend", "three rows a request"):
-        fb = NOT_TAKEN[other]
-        assert lm.forward(fb.input_ids, "p", fb) == "the model's forward"
-    assert runner.launched == []
+    # the runtime-routed forward refuses it too
+    with pytest.raises(ValueError, match="refusing to run SGLang's draft forward"):
+        mtp._Draft(lm, runner).forward(None, fb.input_ids, "p", fb)
+    assert runner.launched == [] and lm.ran == []
+
+
+class _QsaBackend:
+    """SGLang's QSA backend: the MTP sparse-selection hooks and their state."""
+
+    def __init__(self, shared):
+        self._mtp_shared_sparse_indices = shared
+
+    def set_mtp_shared_sparse_indices(self, state):
+        self._mtp_shared_sparse_indices = state
+
+
+@pytest.mark.parametrize("hybrid", [False, True], ids=["qsa", "hybrid"])
+def test_a_draft_step_on_shared_sparse_indices_is_refused(monkeypatch, hybrid):
+    from sglang.srt.model_executor import forward_context
+
+    monkeypatch.setattr(mtp, "_shares_mtp_sparse_indices", SHARES_MTP_SPARSE_INDICES)
+    backend = _QsaBackend(shared=None)
+    step_backend = SimpleNamespace(full_attn_backend=backend) if hybrid else backend
+    monkeypatch.setattr(forward_context, "get_attn_backend", lambda: step_backend)
+    lm, runner = _wrapped()
+    fb = _step("DECODE", 2, 2)
+    lm.forward(fb.input_ids, "p", fb)
+    assert runner.launched == [("DECODE", 2)]
+    # index sharing on: SGLang's draft decode would reuse a selection the launched
+    # draft extend never writes
+    backend._mtp_shared_sparse_indices = object()
+    fb = _step("DRAFT_EXTEND_V2", 2, 8)
+    with pytest.raises(ValueError, match="shares one sparse selection"):
+        lm.forward(fb.input_ids, "p", fb)
+    assert runner.launched == [("DECODE", 2)]
 
 
 def test_every_draft_call_site_calls_the_model_forward_attribute():
@@ -347,13 +397,32 @@ def test_build_installs_the_wrapper(monkeypatch, caplog):
     lm.model = SimpleNamespace(
         layers=[layer], embed_tokens=SimpleNamespace(weight=torch.zeros(1))
     )
+    # the checkpoint's config turns SGLang's QSA MTP index sharing on
+    hf_config = _replace(VL, text_config=_replace(TEXT))
+    hf_config.text_config.index_share_for_mtp_iteration = True
     with caplog.at_level("INFO"):
-        draft = mtp._build(lm, VL, SimpleNamespace(copies={}, deadline_s=1.0))
+        draft = mtp._build(lm, hf_config, SimpleNamespace(copies={}, deadline_s=1.0))
     assert "forward" in lm.__dict__
     assert "are routed by the spec's wrapper of the draft's forward" in caplog.text
     fb = _step("DECODE", 1, 1)
     lm.forward(fb.input_ids, "p", fb)
     assert draft.runner.launched == [("DECODE", 1)] and lm.ran == []
+    # the draft worker reads the flag after the build: sharing off, on both levels
+    assert hf_config.text_config.index_share_for_mtp_iteration is False
+    assert hf_config.index_share_for_mtp_iteration is False
+    assert "QSA MTP index sharing off (index_share_for_mtp_iteration True" in (
+        caplog.text
+    )
+
+
+def test_the_draft_worker_reads_index_sharing_off_after_the_build():
+    from sglang.srt.speculative.eagle_worker_v2 import _qsa_index_share_requested
+
+    hf_config = _replace(VL, text_config=_replace(TEXT))
+    hf_config.text_config.index_share_for_mtp_iteration = True
+    assert _qsa_index_share_requested(hf_config)
+    mtp._turn_off_mtp_index_share(hf_config)
+    assert not _qsa_index_share_requested(hf_config)
 
 
 def test_the_recipe_is_accepted():

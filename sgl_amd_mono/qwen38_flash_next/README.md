@@ -205,8 +205,10 @@ Extend runs R x 4 rows, each decode step R x 1. Monokernel API 1 routes a draft 
 which the draft never runs, so `draft.py` installs a wrapper in front of the draft model's forward at build. It
 decides by forward mode, batch size, row count and the hidden-state buffer (contiguous bf16 `[rows, 10240]`) only,
 so a captured CUDA graph replays the decision made at capture. It checks the draft's attention backend (`qsa`) once
-per step mode, logs each draft key at its first launch, and refuses to capture a draft-shaped step whose hidden
-states the launch cannot read (SGLang's capture check does not see draft steps).
+per step mode and logs each draft key at its first launch. A draft step of 1-8 requests the launch cannot read
+raises instead of running SGLang's draft forward. `_build` turns SGLang's QSA MTP index sharing off for the draft:
+with it on, SGLang's draft decode reuses the selection SGLang's draft extend stored, which a launched extend never
+writes, so a batch growing past 8 requests would decode on a stale selection.
 
 `DraftRunner` reads the input ids, and hidden states that are not the previous draft step's output, from copies at
 fixed addresses, and writes each step's streams to the one of two buffers its input does not overlap, so the tables

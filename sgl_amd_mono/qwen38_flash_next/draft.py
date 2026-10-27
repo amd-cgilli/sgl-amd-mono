@@ -15,12 +15,15 @@ what the runtime does for a routed step, checking the draft's attention backend
 ("qsa") once per step mode. It can move to SGLang if a later monokernel API
 routes a draft's own steps.
 
-SGLang's capture check never sees a draft step (the draft's graph runners run no
-capture tail hooks), so this module logs each draft key the first time it
-launches, and refuses, during graph capture, a step shaped like a draft step
-whose hidden states the launch cannot read, instead of letting the graph fall
-back silently. Check mode (``SGLANG_AMD_MONO_CHECK``) does not cover the draft
-yet, and fault injection arms the target's launches only.
+Every draft extend and draft decode step of 1 to 8 requests runs the launch: one
+the launch cannot read raises instead of running SGLang's forward; larger steps
+run SGLang's forward. ``_build`` turns SGLang's QSA MTP index sharing off for the
+draft: with it on, SGLang's draft decode reuses the selection its own draft extend
+stored, which a launched extend never writes, so a batch growing past 8 requests
+would decode with a stale selection. SGLang's capture check never sees a draft
+step, so this module logs each draft key the first time it launches. Check mode
+(``SGLANG_AMD_MONO_CHECK``) does not cover the draft yet, and fault injection arms
+the target's launches only.
 
 A draft step is one launch (``gfx950/runner.DraftRunner``): the MTP input fusion
 (the token embedding and the target's hyper-connection hidden states, each
@@ -89,6 +92,15 @@ SGLANG_READS = {
     ),
     "srt/model_executor/forward_context.py": ("get_attn_backend",),
     "srt/layers/attention/base_attn_backend.py": ("decode_attention_backend_str",),
+    "srt/layers/attention/qsa/glue.py": ("resolve_qsa_sparse_backend",),
+    "srt/layers/attention/qwen_sparse_attn_backend.py": ("_mtp_shared_sparse_indices",),
+    "srt/configs/qwen4_exp.py": ("text_config", "index_share_for_mtp_iteration"),
+    # the draft worker reads the flag from the draft's config, text_config first,
+    # when it sets up the draft's attention backends, after the draft's build
+    "srt/speculative/eagle_worker_v2.py": (
+        '"index_share_for_mtp_iteration"',
+        "_configure_qsa_mtp_index_share",
+    ),
     "srt/speculative/draft_utils.py": ('"qsa"',),
     "srt/speculative/*.py": ("hidden_states",),
     "srt/runtime_context.py": ("get_parallel", '"tp_size"'),
@@ -122,10 +134,31 @@ def _step_backend() -> Optional[str]:
     return get_attn_backend().decode_attention_backend_str
 
 
-def _is_capturing() -> bool:
-    import torch
+def _shares_mtp_sparse_indices() -> bool:
+    """Whether the current step's QSA backend holds SGLang's shared MTP selection
+    (index sharing on)."""
+    from sglang.srt.layers.attention.qsa.glue import resolve_qsa_sparse_backend
+    from sglang.srt.model_executor.forward_context import get_attn_backend
 
-    return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+    backend = resolve_qsa_sparse_backend(get_attn_backend())
+    return getattr(backend, "_mtp_shared_sparse_indices", None) is not None
+
+
+def _turn_off_mtp_index_share(hf_config) -> None:
+    """Turn SGLang's QSA MTP index sharing off for the draft (see the module
+    docstring). The draft worker reads the flag from the draft's own config,
+    text_config first, after the build and before it sets up the draft's
+    attention backends, so no shared selection is ever created."""
+    text = target._text(hf_config)
+    was = getattr(text, "index_share_for_mtp_iteration", None)
+    for config in (text, hf_config):
+        config.index_share_for_mtp_iteration = False
+    logger.info(
+        "monokernel qwen38_flash_next MTP draft: SGLang's QSA MTP index sharing off "
+        "(index_share_for_mtp_iteration %r -> False), so every draft decode "
+        "selects its own blocks",
+        was,
+    )
 
 
 class _Draft:
@@ -134,57 +167,48 @@ class _Draft:
     def __init__(self, lm, runner):
         self.lm, self.runner = lm, runner
         self.seen: set = set()
-        self.refused: set = set()
         self.backend_checked: set = set()
-
-    def _is_draft_shaped(self, fb) -> bool:
-        """A draft extend of R x L_ext rows or a draft decode of R x 1, R <= max."""
-        r, R = self.runner, int(fb.batch_size)
-        if not 1 <= R <= r.max_reqs:
-            return False
-        n, mode = int(fb.input_ids.numel()), fb.forward_mode
-        return (mode.is_draft_extend_v2() and n == R * r.L_ext) or (
-            mode.is_decode() and n == R
-        )
 
     def takes(self, forward_batch, input_embeds=None) -> bool:
         """Whether the launch runs this step: static properties of the step only
         (mode, batch size, rows, the hidden-state buffer), so graph-capture safe.
 
-        A step shaped like a draft step whose hidden states the launch cannot read
-        is refused during graph capture (the graph would run the standard path
-        for good) and logged once eagerly."""
-        from sgl_amd_mono.qwen38_flash_next.gfx950.runner import draft_eligible
+        A draft extend or draft decode of 1 to ``max_reqs`` requests the launch
+        cannot read raises, eager or in capture: SGLang's forward must not run a
+        draft step the launch serves (see the module docstring)."""
+        from sgl_amd_mono.qwen38_flash_next.gfx950.runner import (
+            HC_DIM,
+            draft_eligible,
+        )
 
-        r, spec = self.runner, forward_batch.spec_info
-        hidden = None if spec is None else spec.hidden_states
-        if input_embeds is None and draft_eligible(
-            forward_batch, hidden, r.L_ext, r.max_reqs
-        ):
+        r, fb = self.runner, forward_batch
+        hidden = None if fb.spec_info is None else fb.spec_info.hidden_states
+        if input_embeds is None and draft_eligible(fb, hidden, r.L_ext, r.max_reqs):
             return True
-        if input_embeds is None and self._is_draft_shaped(forward_batch):
-            fb = forward_batch
-            key = (fb.forward_mode.name, int(fb.batch_size), int(fb.input_ids.numel()))
-            what = (
-                "no hidden states"
-                if hidden is None
-                else f"hidden states {hidden.dtype} {tuple(hidden.shape)}"
-                f"{'' if hidden.is_contiguous() else ' (strided)'}"
-            )
-            why = (
-                f"Qwen3.8-Flash-Next MTP draft step {key} has {what}; the launch "
-                "reads contiguous bf16 [rows, hc] hidden states"
-            )
-            if _is_capturing():
-                raise ValueError(why + ": refusing to capture the standard path")
-            if key not in self.refused:
-                self.refused.add(key)
-                logger.warning("%s: this step runs the standard path", why)
-        return False
+        mode, R = fb.forward_mode, int(fb.batch_size)
+        is_extend = mode.is_draft_extend_v2()
+        if not (is_extend or mode.is_decode()) or not 1 <= R <= r.max_reqs:
+            return False
+        if input_embeds is not None:
+            what = "input embeddings"
+        elif hidden is None:
+            what = "no hidden states"
+        else:
+            strided = "" if hidden.is_contiguous() else " (strided)"
+            what = f"hidden states {hidden.dtype} {tuple(hidden.shape)}{strided}"
+        key = (mode.name, R, int(fb.input_ids.numel()))
+        rows = R * r.L_ext if is_extend else R
+        raise ValueError(
+            f"Qwen3.8-Flash-Next MTP draft step {key} has {what}: the launch takes "
+            f"every draft step of 1 to {r.max_reqs} requests, {rows} rows of "
+            f"contiguous bf16 [rows, {HC_DIM}] hidden states and no input "
+            "embeddings; refusing to run SGLang's draft forward"
+        )
 
     def check_backend(self, forward_batch) -> None:
         """Refuse a draft step on an attention backend whose caches the launch does
-        not write, once per step mode (what the runtime does for routed steps)."""
+        not write, or that shares one QSA selection across the draft steps, once
+        per step mode (what the runtime does for routed steps)."""
         mode = forward_batch.forward_mode.name
         if mode in self.backend_checked:
             return
@@ -194,6 +218,13 @@ class _Draft:
                 f"--monokernel-backend amd: {SPEC.name} needs a draft attention "
                 f"backend in {sorted(DRAFT_ATTENTION_BACKENDS)}, this {mode} step's "
                 f"is {backend!r}"
+            )
+        if _shares_mtp_sparse_indices():
+            raise ValueError(
+                f"--monokernel-backend amd: {SPEC.name}: this {mode} step's QSA "
+                "backend shares one sparse selection across the MTP draft steps "
+                "(index_share_for_mtp_iteration on); SGLang's draft decode would "
+                "read a selection the launched draft extend never writes"
             )
         self.backend_checked.add(mode)
 
@@ -249,6 +280,7 @@ def _build(model, hf_config, ctx) -> _Draft:
     from sgl_amd_mono.qwen38_flash_next.gfx950 import weights
     from sgl_amd_mono.qwen38_flash_next.gfx950.runner import DraftRunner
 
+    _turn_off_mtp_index_share(hf_config)
     params = weights.param_ptrs(model)
     views = weights.mtp_views(model, ctx.copies, params)
     layer = model.model.layers[0]
@@ -272,8 +304,8 @@ def _build(model, hf_config, ctx) -> _Draft:
     logger.info(
         "monokernel qwen38_flash_next MTP draft: draft extend steps of up to %d x %d "
         "rows and draft decode steps of up to %d x 1 are routed by the spec's "
-        "wrapper of the draft's forward; each key logs 'MTP draft runs' at its "
-        "first launch",
+        "wrapper of the draft's forward, and one it cannot launch raises; each key "
+        "logs 'MTP draft runs' at its first launch",
         runner.max_reqs,
         runner.L_ext,
         runner.max_reqs,
