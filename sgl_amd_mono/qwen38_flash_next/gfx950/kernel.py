@@ -197,7 +197,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
     keyed = key_tuple(key, SOURCES)
     plan, nreq, ntok = key.layers, key.nreq, key.ntok
     rtt_stride, pos_stride, map_i64 = key.rtt_stride, key.pos_stride, key.map_i64
-    seq_p0 = key.seq_p0
+    seq_p0, ring = key.seq_p0, key.ring
     ple_first, final_mix, prelude = key.ple_first, key.final_mix, key.prelude
     eos_token_id, first_src, ssm_bf16 = key.eos_token_id, key.first_src, key.ssm_bf16
     issm_row, ple_ist_row, ictx_row = key.issm_row, key.ple_ist_row, key.ictx_row
@@ -3040,7 +3040,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                     fx.BFloat16
                                 ),
                                 r_ring,
-                                (req * 4 + pos % 4) * 128 + tid,
+                                (req * ring + pos % ring) * 128 + tid,
                             )
                         if tid < 3:
                             bo.buffer_store(
@@ -3052,7 +3052,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                     fx.Int32,
                                 ),
                                 r_rp,
-                                ((req * 4 + pos % 4) * 3 + tid) * 2,
+                                ((req * ring + pos % ring) * 3 + tid) * 2,
                             )
                         if (pos + 1) % 4 == 0:
                             acc = fx.Float32(0.0)
@@ -3068,7 +3068,9 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                         fx.BFloat16(
                                             bo.buffer_load(
                                                 r_ring,
-                                                (req * 4 + g) * 128 + tid,
+                                                (req * ring + (pos - 3 + g) % ring)
+                                                * 128
+                                                + tid,
                                                 vec_width=1,
                                                 dtype=T.bf16,
                                             )
@@ -3093,7 +3095,7 @@ def build_qwen38_flash_next_kernel(key: MonoBuild):
                                     fx.Int32(
                                         bo.buffer_load(
                                             r_rp,
-                                            ((req * 4 + ps % 4) * 3 + a) * 2,
+                                            ((req * ring + ps % ring) * 3 + a) * 2,
                                             vec_width=1,
                                             dtype=T.i32,
                                         )

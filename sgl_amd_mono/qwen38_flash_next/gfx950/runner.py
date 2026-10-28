@@ -63,6 +63,7 @@ SGLANG_READS = {
         "get_qsa_key_state_buffer",
         "get_qsa_compressed_k_buffer",
         "qsa_rope_position_buffer",
+        "qsa_num_request_slots",
     ),
     "srt/model_executor/forward_batch_info.py": (
         "forward_mode",
@@ -220,9 +221,16 @@ def _qsa_buffers(kvp, layer_id: int):
     )
 
 
+def ring_width(kvp) -> int:
+    """Index-key ring slots a request in SGLang's QSA pool."""
+    return kvp.qsa_rope_position_buffer.shape[0] // kvp.qsa_num_request_slots
+
+
 def qsa_cache_reasons(kvp, layer_id: int) -> list[str]:
     k_buf, v_buf, ring, comp = _qsa_buffers(kvp, layer_id)
     reasons = []
+    if ring_width(kvp) not in (4, 8):
+        reasons.append(f"an index-key ring of {ring_width(kvp)} slots a request")
     for name, b in (("K", k_buf), ("V", v_buf)):  # 64-bit addressed (any pool size)
         if b.dtype != torch.bfloat16 or not b.is_contiguous() or b.shape[-2:] != (2, 256):  # fmt: skip
             reasons.append(
@@ -516,6 +524,7 @@ class VerifyRunner(_Base):
             ple_ist_row=ple_ist_row,
             ictx_row=ngram_ictx.stride(0),
             ssm_bf16=bool(ssm_bf16),
+            ring=ring_width(kvp),
         )
         return tables, meta
 
@@ -643,6 +652,7 @@ class DraftRunner(_Base):
             pos_stride=pos.stride(0) if pos.dim() == 2 else 0,
             final_mix=True,
             first_src="mtp",
+            ring=ring_width(kvp),
         )
         return self._keep(key, (self._upload(rows), build))
 

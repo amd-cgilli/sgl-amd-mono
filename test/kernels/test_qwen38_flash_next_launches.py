@@ -45,6 +45,7 @@ from sgl_amd_mono.qwen38_flash_next.gfx950.config import (  # noqa: E402
 )
 
 DEV = "cuda"
+RING = 8  # index-key ring slots a request: two groups, as SGLang's QSA pool keeps them
 KINDS = ["qsa" if i % 4 == 3 else "gdn" for i in range(12)]
 EOS, VOCAB = 248044, 248320
 L, MAX_R = 4, 8  # verify rows a request (3 draft steps + 1), requests
@@ -220,12 +221,13 @@ class Pools:
             for b, c in zip(BASES, CONTEXTS):
                 k[b : b + c], v[b : b + c] = rnd(c, 2, 256, scale=0.5), rnd(c, 2, 256, scale=0.5)  # fmt: skip
                 comp[b // 4 : (b + c) // 4] = rnd((b + c) // 4 - b // 4, 1, 128, scale=0.5)  # fmt: skip
-            self.kv[i] = SimpleNamespace(k=k, v=v, comp=comp, ring=rnd(n_req * 4, 1, 128, scale=0.5))  # fmt: skip
-        # the RoPE positions of each request's pending keys c - 4 .. c - 1
-        self.qsa_rope_position_buffer = zeros(n_req * 4, 3, dtype=torch.int64)
+            self.kv[i] = SimpleNamespace(k=k, v=v, comp=comp, ring=rnd(n_req * RING, 1, 128, scale=0.5))  # fmt: skip
+        # the RoPE positions of each request's last keys c - RING .. c - 1
+        self.qsa_rope_position_buffer = zeros(n_req * RING, 3, dtype=torch.int64)
+        self.qsa_num_request_slots = n_req
         for r, c in enumerate(CONTEXTS):
-            for q in range(4):
-                self.qsa_rope_position_buffer[self.reqs[r] * 4 + q] = c - 1 - (c - 1 - q) % 4  # fmt: skip
+            for q in range(RING):
+                self.qsa_rope_position_buffer[self.reqs[r] * RING + q] = c - 1 - (c - 1 - q) % RING  # fmt: skip
         self.short_conv = rnd(n_slot, HC_DIM, LY.PLE_STATE_LEN, scale=0.5)
         self.short_conv_ist = zeros(n_scr, L, HC_DIM, LY.PLE_STATE_LEN)
         ctx = torch.randint(0, 248000, (n_slot, 2), generator=g, device=DEV)
@@ -274,7 +276,7 @@ class Pools:
         """Pool tensor -> the rows step ``b`` may write (none if absent): its KV slots
         and compressed groups, its requests' ring and RoPE rows, its scratch rows."""
         locs = b.out_cache_loc.unique()
-        ring = (b.req_pool_indices[:, None] * 4 + torch.arange(4, device=DEV)).flatten()
+        ring = (b.req_pool_indices[:, None] * RING + torch.arange(RING, device=DEV)).flatten()  # fmt: skip
         scratch = torch.arange(b.batch_size, device=DEV)
         out = {"rope_pos": ring, "short_conv_ist": scratch, "ngram_ictx": scratch}
         for i in self.mamba:

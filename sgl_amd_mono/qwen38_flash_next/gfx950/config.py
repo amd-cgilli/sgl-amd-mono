@@ -71,6 +71,9 @@ class MonoBuild(msgspec.Struct, frozen=True):
     # each request's first sequence position is its seq_lens entry (a target verify,
     # whose RoPE positions may be MRoPE's), not its first row's position
     seq_p0: bool = False
+    # index-key ring slots a request in SGLang's QSA pool: 4 (one group), or 8 (two
+    # groups, so a verify window never overwrites the pending group's members)
+    ring: int = 4
     # SGLANG_AMD_MONO_FAULT_INJECT: the wait this launch stalls at (0: none), once
     # fault_after steps have run
     fault_site: int = 0
