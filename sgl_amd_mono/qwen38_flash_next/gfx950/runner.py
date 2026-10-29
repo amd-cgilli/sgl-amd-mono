@@ -47,18 +47,24 @@ SGLANG_READS = {
     "srt/mem_cache/memory_pool.py": (
         "req_to_token",
         "req_index_to_mamba_index_mapping",
+        "layer_router",
         "mamba2_layer_cache",
         "conv",
         "temporal",
         "intermediate_ssm",
         "intermediate_conv_window",
-        "short_conv_layer_cache",
-        "short_conv_layer_intermediate_cache",
         "ngram_pool",
         "get_key_buffer",
         "get_value_buffer",
     ),
-    "srt/mem_cache/ple_state_pool.py": ("context", "intermediate_context"),
+    "srt/mem_cache/kv/router.py": ("read", "view", "view_layer_id", '"state"'),
+    "srt/mem_cache/ple_state_pool.py": (
+        "context",
+        "intermediate_context",
+        "layer_cache",
+        "layer_intermediate_cache",
+        '"short_conv"',
+    ),
     "srt/mem_cache/qsa_kv_pool.py": (
         "get_qsa_key_state_buffer",
         "get_qsa_compressed_k_buffer",
@@ -221,6 +227,20 @@ def _qsa_buffers(kvp, layer_id: int):
     )
 
 
+def gdn_cache(kvp, layer_id: int):
+    """A GDN layer's conv / SSM states and their verify intermediates."""
+    r = kvp.layer_router.read(layer_id, "state")
+    return r.view.mamba2_layer_cache(r.view_layer_id)
+
+
+def ple_states(kvp, layer_id: int):
+    """The PLE short-conv state and its verify intermediate."""
+    r = kvp.layer_router.read(layer_id, "short_conv")
+    return r.view.layer_cache(r.view_layer_id), r.view.layer_intermediate_cache(
+        r.view_layer_id
+    )
+
+
 def ring_width(kvp) -> int:
     """Index-key ring slots a request in SGLang's QSA pool."""
     return kvp.qsa_rope_position_buffer.shape[0] // kvp.qsa_num_request_slots
@@ -371,7 +391,7 @@ class VerifyRunner(_Base):
             if kind == "qsa":
                 reasons += qsa_cache_reasons(kvp, layer_id)
                 continue
-            cache = rtp.mamba2_layer_cache(layer_id)
+            cache = gdn_cache(kvp, layer_id)
             conv, ssm = cache.conv[0], cache.temporal
             ssm_dtypes.add(ssm.dtype)
             if (
@@ -415,7 +435,7 @@ class VerifyRunner(_Base):
                     "kernel writes"
                 )
             if layer_id == 1:
-                istate = rtp.short_conv_layer_intermediate_cache(layer_id)
+                state, istate = ple_states(kvp, layer_id)
                 if (
                     istate is None
                     or istate.dtype != torch.bfloat16
@@ -428,7 +448,6 @@ class VerifyRunner(_Base):
                         "layer 1: needs the PLE's intermediate short-conv state, bf16 "
                         f"[>= {R}, >= {L}, {HC_DIM}, {LY.PLE_STATE_LEN}]"
                     )
-                state = rtp.short_conv_layer_cache(layer_id)
                 if (
                     state.dtype != torch.bfloat16
                     or not state.is_contiguous()
@@ -490,7 +509,7 @@ class VerifyRunner(_Base):
                 if self.kinds[layer_id] == "qsa":
                     rows.append(packing.qsa_ptr_row(t, *_qsa_buffers(kvp, layer_id)))
                     continue
-                cache = rtp.mamba2_layer_cache(layer_id)
+                cache = gdn_cache(kvp, layer_id)
                 conv, ssm = cache.conv[0], cache.temporal
                 ssm_bf16 = ssm.dtype == torch.bfloat16
                 row = packing.gdn_ptr_row(t, conv, ssm)
@@ -507,10 +526,8 @@ class VerifyRunner(_Base):
                     )
                 iconv, issm_row = st, issm.stride(0)
                 if li == PLE_LAUNCH and layer_id == layer_ids[0]:
-                    packing.add_ple_ptrs(
-                        row, t["ple"], rtp.short_conv_layer_cache(layer_id)
-                    )
-                    ple_ist = rtp.short_conv_layer_intermediate_cache(layer_id)
+                    ple_state, ple_ist = ple_states(kvp, layer_id)
+                    packing.add_ple_ptrs(row, t["ple"], ple_state)
                     row[LY.P_PLE_ISTATE] = ple_ist.data_ptr()
                     ple_ist_row = ple_ist.stride(0)
                 rows.append(row)

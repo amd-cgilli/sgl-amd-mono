@@ -235,8 +235,9 @@ class Pools:
         self.ngram_pool = SimpleNamespace(context=ctx, intermediate_context=ictx)
         # the accessors the runners call
         self.mamba2_layer_cache = self.mamba.__getitem__
-        self.short_conv_layer_cache = lambda i: self.short_conv
-        self.short_conv_layer_intermediate_cache = lambda i: self.short_conv_ist
+        self.layer_cache = lambda i: self.short_conv
+        self.layer_intermediate_cache = lambda i: self.short_conv_ist
+        self.layer_router = SimpleNamespace(read=lambda i, part: SimpleNamespace(view=self, view_layer_id=i))  # fmt: skip
         self.get_key_buffer = lambda i: self.kv[i].k
         self.get_value_buffer = lambda i: self.kv[i].v
         self.get_qsa_key_state_buffer = lambda i: self.kv[i].ring

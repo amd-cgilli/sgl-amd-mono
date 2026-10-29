@@ -32,32 +32,34 @@ SGLANG_READS = {
         "batch_size",
         "req_pool_indices",
     ),
-    "srt/model_executor/forward_context.py": ("get_req_to_token_pool",),
-    "srt/mem_cache/memory_pool.py": (
-        "get_mamba_indices",
-        "mamba2_layer_cache",
-        "conv",
-        "temporal",
-        "short_conv_layer_cache",
+    "srt/model_executor/forward_context.py": (
+        "get_req_to_token_pool",
+        "get_token_to_kv_pool",
     ),
+    "srt/mem_cache/memory_pool.py": ("get_mamba_indices", "conv", "temporal"),
 }
 
 
 def _committed_state(kinds: list[str], forward_batch) -> list[tuple]:
     """The committed recurrent state the launches read: SGLang's verify conv update
     rolls the draft tokens into the GDN (and PLE short-conv) state in place."""
-    from sglang.srt.model_executor.forward_context import get_req_to_token_pool
+    from sglang.srt.model_executor.forward_context import (
+        get_req_to_token_pool,
+        get_token_to_kv_pool,
+    )
 
-    rtp = get_req_to_token_pool()
+    from sgl_amd_mono.qwen38_flash_next.gfx950.runner import gdn_cache, ple_states
+
+    rtp, kvp = get_req_to_token_pool(), get_token_to_kv_pool()
     slots = rtp.get_mamba_indices(forward_batch.req_pool_indices).long()
     saved = []
     for layer_id, kind in enumerate(kinds):
         if kind != "gdn":
             continue
-        cache = rtp.mamba2_layer_cache(layer_id)
+        cache = gdn_cache(kvp, layer_id)
         for t in (cache.conv[0], cache.temporal):
             saved.append((t, slots, t[slots].clone()))
-    ple = rtp.short_conv_layer_cache(1)
+    ple = ple_states(kvp, 1)[0]
     saved.append((ple, None, ple.clone()))
     return saved
 
