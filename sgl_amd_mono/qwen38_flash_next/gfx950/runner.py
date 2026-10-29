@@ -229,6 +229,10 @@ def ring_width(kvp) -> int:
 def qsa_cache_reasons(kvp, layer_id: int) -> list[str]:
     k_buf, v_buf, ring, comp = _qsa_buffers(kvp, layer_id)
     reasons = []
+    # 4 slots (one group): a verify row past the pending group overwrites one of its
+    # members, and a rejected row's key stays there, so the group can later compress
+    # with it (as in SGLang's own verify). 8 slots (two groups, sgl-project/sglang#47051)
+    # keep every pending member.
     if ring_width(kvp) not in (4, 8):
         reasons.append(f"an index-key ring of {ring_width(kvp)} slots a request")
     for name, b in (("K", k_buf), ("V", v_buf)):  # 64-bit addressed (any pool size)

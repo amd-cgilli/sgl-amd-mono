@@ -77,7 +77,8 @@ combine-gate partials.
    the indexer's q / k (SGLang's `qkv_proj` and `indexer.index_qk_proj`).
 2. `stage_qsa_prep`: q / k norms and partial RoPE (64 of 256 dims, interleaved MRoPE sections); writes the new
    tokens' K / V into SGLang's KV cache at `out_cache_loc`, the indexer keys and their RoPE positions into the
-   request's 4-entry ring and, when a 4-token group completes, its compressed key.
+   request's index-key ring (SGLang's QSA pool: 4 slots a request, or 8 with sgl-project/sglang#47051) and, when a
+   4-token group completes, its compressed key.
 3. `stage_qsa_scores`: index logits of every complete 4-token block of the context for every row (MFMA over
    compressed keys, ReLU-sum over the 4 indexer heads).
 4. `stage_qsa_select` / `stage_qsa_merge_select`: exact top-512 blocks per row: a radix select per 8192-block
@@ -271,5 +272,8 @@ of a step grows with it. Batches above 8 requests run SGLang's forward.
 - TP = 1
 - bf16 KV cache; `triton` or `aiter` attention backend
 - contexts up to 294,848 tokens
+- with SGLang's 4-slot index-key ring, a verify row past the pending group overwrites one of its members, and a
+  rejected row's key stays in its slot, so the group can later compress with it, as in SGLang's own verify; the
+  8-slot ring of sgl-project/sglang#47051 removes this
 - a padded graph batch's real rows are not run-to-run deterministic: the pad rows race on KV slot 0, and each row's
   MoE sums its experts in an order that depends on the whole batch's routes
