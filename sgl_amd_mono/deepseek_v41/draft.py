@@ -251,7 +251,8 @@ SPEC = MonoSpec(
             resident_blocks=BLOCKS,
         )
     },
-    features=frozenset({Feature.SPECULATIVE_DECODING}),
+    # its target's PD gate (decode on MoRI) holds for the draft as well
+    features=frozenset({Feature.SPECULATIVE_DECODING, Feature.PD_DISAGGREGATION}),
     # the launcher checks the target's; SGLang checks the draft runner's at its first routed step
     requires=Requirements(attention_backends=target.SPEC.requires.attention_backends),
     numerics=target.NUMERICS,

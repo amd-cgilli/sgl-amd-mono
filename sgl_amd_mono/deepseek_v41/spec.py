@@ -136,6 +136,8 @@ SGLANG_READS = {
         "fp8_gemm_runner_backend",
         "context_length",
         "expert_distribution_recorder_mode",
+        "disaggregation_mode",
+        "disaggregation_transfer_backend",
     ),
     "srt/environ.py": (
         "SGLANG_DSV4_FP4_EXPERTS",
@@ -365,12 +367,18 @@ def _covered_layers(config) -> list[int]:
 
 
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
-    """What ``SPEC.requires`` cannot state: a value SGLang's attention gate must not
-    take, aiter's own flag, and FlyDSL."""
+    """What ``SPEC.requires`` cannot state: PD roles other than a MoRI decode server, a
+    value SGLang's attention gate must not take, aiter's own flag, and FlyDSL."""
     from sglang.srt.layers.attention.dsv4.unified_kv_gate import is_unified_kv_triton
     from sglang.srt.utils import get_bool_env_var
 
     reasons = []
+    mode = cfg.disaggregation_mode
+    if mode not in (None, "null"):
+        if mode != "decode":
+            reasons.append("PD monokernels support the decode role only")
+        elif cfg.disaggregation_transfer_backend != "mori":
+            reasons.append("PD monokernels require the mori transfer backend")
     if is_unified_kv_triton():
         reasons.append("needs the paged SWA cache, not unified_kv")
     if get_bool_env_var("AITER_FORCE_A8W4"):
@@ -1205,7 +1213,8 @@ SPEC = MonoSpec(
             resident_blocks=BLOCKS,
         )
     },
-    features=frozenset({Feature.SPECULATIVE_DECODING}),
+    # MoRI transfers into the same KV, compressor-state and index-key buffers the kernels use
+    features=frozenset({Feature.SPECULATIVE_DECODING, Feature.PD_DISAGGREGATION}),
     requires=Requirements(
         dtypes=frozenset({"bfloat16"}),
         attention_backends=frozenset({"dsv4"}),
